@@ -94,6 +94,18 @@ def _placement_candidates(bay: Bay, placed: list[Block], g: placement.OrientGeom
     return placement.candidate_positions(bay, placed, g, max_candidates=max_cand)
 
 
+def _nfp_candidates(bay: Bay, placed: list[Block], g: placement.OrientGeom,
+                    max_cand):
+    return placement.nfp_candidate_positions(bay, placed, g, max_candidates=max_cand)
+
+
+_GENERATORS = {
+    "baseline":  _baseline_candidates,
+    "placement": _placement_candidates,
+    "nfp":       _nfp_candidates,
+}
+
+
 def pack_bay(bay: Bay, block_ids: list[int], blocks_data: list[dict],
              geom: placement.GeometryCache, gen_name: str,
              budget: float, max_cand) -> dict:
@@ -101,7 +113,7 @@ def pack_bay(bay: Bay, block_ids: list[int], blocks_data: list[dict],
     First-Fit-Decreasing packing of block_ids into a single bay, all sharing the
     time window [0, 1).  Returns metrics dict.
     """
-    gen = _baseline_candidates if gen_name == "baseline" else _placement_candidates
+    gen = _GENERATORS[gen_name]
 
     placed: list[Block] = []
     scheds: list[tuple[int, int]] = []
@@ -144,7 +156,8 @@ def pack_bay(bay: Bay, block_ids: list[int], blocks_data: list[dict],
     }
 
 
-def run_instance(prob_info: dict, budget: float, cap: int | None, max_cand):
+def run_instance(prob_info: dict, gens: list[str], budget: float,
+                 cap: int | None, max_cand):
     bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
     geom = placement.GeometryCache(prob_info)
     blocks_data = prob_info["blocks"]
@@ -160,10 +173,8 @@ def run_instance(prob_info: dict, budget: float, cap: int | None, max_cand):
     if cap:
         order = order[:cap]
 
-    out = {}
-    for gen_name in ("baseline", "placement"):
-        out[gen_name] = pack_bay(big, order, blocks_data, geom, gen_name,
-                                 budget, max_cand)
+    out = {g: pack_bay(big, order, blocks_data, geom, g, budget, max_cand)
+           for g in gens}
     out["bay"] = f"{big.width}x{big.height}"
     out["n_try"] = len(order)
     return out
@@ -172,6 +183,9 @@ def run_instance(prob_info: dict, budget: float, cap: int | None, max_cand):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instances", default=str(ROOT / "data" / "train" / "*.json"))
+    ap.add_argument("--gens", default="baseline,nfp",
+                    help="comma list of generators to compare "
+                         f"(available: {','.join(_GENERATORS)})")
     ap.add_argument("--cap", type=int, default=80,
                     help="max blocks to attempt per instance (0 = all)")
     ap.add_argument("--budget", type=float, default=8.0,
@@ -180,37 +194,42 @@ def main():
                     help="cap on candidates per orientation (0 = unlimited)")
     args = ap.parse_args()
 
+    gens = [g.strip() for g in args.gens.split(",") if g.strip()]
+    for g in gens:
+        if g not in _GENERATORS:
+            raise SystemExit(f"unknown generator '{g}'; available: {list(_GENERATORS)}")
+
     files = sorted(glob.glob(args.instances),
                    key=lambda p: int(p.split("_")[-1].split(".")[0]))
     cap = args.cap or None
     max_cand = args.max_cand or None
 
-    print(f"{'instance':10s} {'bay':9s} {'try':>4s} | "
-          f"{'BL_plc':>6s} {'BL_util':>7s} {'BL_s':>6s} | "
-          f"{'PL_plc':>6s} {'PL_util':>7s} {'PL_s':>6s} | {'dPlc':>5s}")
-    print("-" * 92)
+    header = f"{'instance':10s} {'bay':9s} {'try':>4s} |"
+    for g in gens:
+        header += f" {g[:9]:>9s} {'util':>6s} {'s':>5s} |"
+    print(header)
+    print("-" * len(header))
 
-    agg = {"bl_plc": 0, "pl_plc": 0, "bl_util": 0.0, "pl_util": 0.0,
-           "bl_t": 0.0, "pl_t": 0.0, "n": 0}
+    agg = {g: {"plc": 0, "util": 0.0, "t": 0.0} for g in gens}
+    n = 0
     for f in files:
         prob = json.load(open(f))
-        r = run_instance(prob, args.budget, cap, max_cand)
-        bl, pl = r["baseline"], r["placement"]
-        dplc = pl["placed"] - bl["placed"]
-        print(f"{prob['name']:10s} {r['bay']:9s} {r['n_try']:4d} | "
-              f"{bl['placed']:6d} {bl['util']*100:6.1f}% {bl['time']:5.2f}s | "
-              f"{pl['placed']:6d} {pl['util']*100:6.1f}% {pl['time']:5.2f}s | "
-              f"{dplc:+5d}")
-        agg["bl_plc"] += bl["placed"]; agg["pl_plc"] += pl["placed"]
-        agg["bl_util"] += bl["util"]; agg["pl_util"] += pl["util"]
-        agg["bl_t"] += bl["time"]; agg["pl_t"] += pl["time"]; agg["n"] += 1
+        r = run_instance(prob, gens, args.budget, cap, max_cand)
+        row = f"{prob['name']:10s} {r['bay']:9s} {r['n_try']:4d} |"
+        for g in gens:
+            m = r[g]
+            row += f" {m['placed']:9d} {m['util']*100:5.1f}% {m['time']:4.1f}s |"
+            agg[g]["plc"] += m["placed"]; agg[g]["util"] += m["util"]; agg[g]["t"] += m["time"]
+        print(row)
+        n += 1
 
-    n = max(1, agg["n"])
-    print("-" * 92)
-    print(f"{'TOTAL/AVG':10s} {'':9s} {'':>4s} | "
-          f"{agg['bl_plc']:6d} {agg['bl_util']/n*100:6.1f}% {agg['bl_t']:5.1f}s | "
-          f"{agg['pl_plc']:6d} {agg['pl_util']/n*100:6.1f}% {agg['pl_t']:5.1f}s | "
-          f"{agg['pl_plc']-agg['bl_plc']:+5d}")
+    n = max(1, n)
+    print("-" * len(header))
+    tot = f"{'TOTAL/AVG':10s} {'':9s} {'':>4s} |"
+    for g in gens:
+        a = agg[g]
+        tot += f" {a['plc']:9d} {a['util']/n*100:5.1f}% {a['t']:4.1f}s |"
+    print(tot)
 
 
 if __name__ == "__main__":

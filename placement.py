@@ -71,15 +71,21 @@ class OrientGeom:
 
     Attributes
     ----------
-    bbox  : (min_x, min_y, max_x, max_y) of the full footprint in LOCAL
-            coordinates (reference point = (0, 0)).  World bbox at position
-            (x, y) is (min_x + x, min_y + y, max_x + x, max_y + y).
-    width : max_x - min_x  (footprint width, float).
-    height: max_y - min_y  (footprint height, float).
+    bbox       : (min_x, min_y, max_x, max_y) of the full footprint in LOCAL
+                 coordinates (reference point = (0, 0)).  World bbox at position
+                 (x, y) is (min_x + x, min_y + y, max_x + x, max_y + y).
+    width      : max_x - min_x  (footprint width, float).
+    height     : max_y - min_y  (footprint height, float).
+    base_verts : layer-0 polygon vertices in LOCAL coordinates (reference point
+                 at (0, 0)).  Used as the orbiting polygon vertices b_j for NFP
+                 contact-point generation.  Layer 0 is always collision-checked,
+                 so contacts generated on it are the binding ones; the precise
+                 can_place still validates every layer.
     """
-    bbox:   tuple[float, float, float, float]
-    width:  float
-    height: float
+    bbox:       tuple[float, float, float, float]
+    width:      float
+    height:     float
+    base_verts: tuple[tuple[float, float], ...]
 
 
 class GeometryCache:
@@ -108,11 +114,14 @@ class GeometryCache:
             if layers:
                 verts = [v for layer in layers for v in layer]
                 bbox = _bounding_box(verts)
+                base_verts = tuple((float(x), float(y)) for x, y in layers[0])
             else:
                 bbox = (0.0, 0.0, 1.0, 1.0)
+                base_verts = ()
             g = OrientGeom(bbox=bbox,
                            width=bbox[2] - bbox[0],
-                           height=bbox[3] - bbox[1])
+                           height=bbox[3] - bbox[1],
+                           base_verts=base_verts)
             self._cache[key] = g
         return g
 
@@ -211,6 +220,71 @@ def candidate_positions(bay: Bay,
             if max_candidates is not None and len(candidates) >= max_candidates:
                 return candidates
     return candidates
+
+
+# =============================================================================
+# NFP-based candidate generation (contact points)
+# =============================================================================
+
+def nfp_candidate_positions(bay: Bay,
+                            placed_blocks: list[Block],
+                            g: OrientGeom,
+                            max_candidates: int | None = None) -> list[tuple[int, int]]:
+    """
+    Generate integer reference-point candidates from No-Fit-Polygon contact
+    points: positions where the block's layer-0 polygon *touches* an obstacle
+    (a placed block's layer-0 polygon or a bay corner) without overlapping.
+
+    Method (vertex-vertex contact, the classic NFP candidate set)
+    -------------------------------------------------------------
+    For a fixed obstacle vertex a_i and an orbiting block vertex b_j (local,
+    reference at origin), placing the block so that b_j coincides with a_i means
+    the reference point goes to a_i - b_j.  The set { a_i - b_j } over all
+    obstacle and block vertices is a superset of the NFP boundary vertices and,
+    for non-convex polygons too, captures every vertex-vertex tight contact.
+    Bay corners are included as obstacle vertices so the block can also nestle
+    into the bay's corners and walls.
+
+    Each fractional contact is snapped to its four surrounding integer points
+    (floor/ceil x floor/ceil) and kept only if the block's bounding box still
+    fits in the bay.  The bottom-left wall anchor is always included as a
+    fallback.  Results are deduplicated and sorted bottom-left first.
+
+    Passing this returns only AABB-valid positions; can_place() still makes the
+    precise crane/collision decision.  Compared with candidate_positions (bbox
+    corners) this yields contact points that let non-convex blocks interlock.
+    """
+    base = g.base_verts
+    lx0, ly0, lx1, ly1 = g.bbox
+    W, H = bay.width, bay.height
+    eps = 1e-6
+
+    if not base:
+        return candidate_positions(bay, placed_blocks, g, max_candidates)
+
+    # Obstacle vertices: placed blocks' layer-0 world vertices + bay corners.
+    obst: list[tuple[float, float]] = [(0.0, 0.0), (W, 0.0), (0.0, H), (W, H)]
+    for b in placed_blocks:
+        layers = b.layers_at_pos()
+        if layers:
+            obst.extend((v[0], v[1]) for v in layers[0])
+
+    pts: set[tuple[int, int]] = {(max(0, math.ceil(-lx0)), max(0, math.ceil(-ly0)))}
+    for ax, ay in obst:
+        for bx, by in base:
+            rx, ry = ax - bx, ay - by
+            for xi in (math.floor(rx), math.ceil(rx)):
+                if xi + lx0 < -eps or xi + lx1 > W + eps:
+                    continue
+                for yi in (math.floor(ry), math.ceil(ry)):
+                    if yi + ly0 < -eps or yi + ly1 > H + eps:
+                        continue
+                    pts.add((int(xi), int(yi)))
+
+    ordered = sorted(pts, key=lambda p: (p[1], p[0]))
+    if max_candidates is not None:
+        ordered = ordered[:max_candidates]
+    return ordered
 
 
 # =============================================================================

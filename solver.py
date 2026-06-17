@@ -231,7 +231,8 @@ def _feasible_insert(bay: Bay,
 def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int]],
                       blocks_data: list[dict], geom: placement.GeometryCache,
                       bid: int, release: int, proc: int,
-                      max_entries: int, max_pos: int):
+                      max_entries: int, max_pos: int,
+                      deadline: float | None = None):
     """
     Earliest feasible coexisting placement of block bid in `bay`.
     Returns (orient_idx, x, y, entry, exit_t) or None.
@@ -239,6 +240,12 @@ def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int
     Candidate entry times = {release} U {exit times in bay > release}; for each
     (ascending) we take the first feasible (orientation, position).  Earliest
     entry minimizes the block's exit and hence its tardiness.
+
+    `deadline` (wall-clock time) bounds the search: blocks that cannot coexist
+    would otherwise exhaust every (entry, orientation, position) combination and
+    starve the remaining blocks of time.  Bailing at the deadline lets every
+    block get a fair coexistence attempt; the first feasible placement (the
+    common, cheap case) is almost always found well before it.
     """
     cand_entries = sorted({release} | {e for _, e in scheds if e > release})[:max_entries]
     orients = sorted(range(geom.n_orient(bid)),
@@ -256,24 +263,32 @@ def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int
                            x=x, y=y, orient_idx=oi)
                 if _feasible_insert(bay, placed, scheds, nb, entry, exit_t):
                     return oi, x, y, entry, exit_t
+            if deadline is not None and time.time() > deadline:
+                return None
     return None
 
 
 def solve_greedy(prob_info: dict, timelimit: float = 60.0,
-                 max_entries: int = 16, max_pos: int = 40) -> dict:
+                 max_entries: int = 16, max_pos: int = 40,
+                 stats: dict | None = None) -> dict:
     """
     Coexistence-aware greedy: place EDD-ordered blocks at the earliest time/bay
     that keeps the solution feasible (blocks may share a bay when spatially
     compatible), cutting the tardiness that the pure-sequential solver incurs.
 
-    Feasible by construction (only can_place + _obstructs_others-validated
-    placements are committed) -- no repair loop, so it can never emit an
-    infeasible solution.  A strict wall-clock budget falls back to the always-
-    feasible empty-bay window for any remaining blocks, so the time limit is
-    never exceeded.
+    Feasible by construction (only _feasible_insert-validated placements are
+    committed) -- no repair loop, so it can never emit an infeasible solution.
+    A strict wall-clock budget falls back to the always-feasible empty-bay window
+    for any remaining blocks, so the time limit is never exceeded.
+
+    If `stats` (a dict) is passed it is filled with diagnostics:
+      n_coexist  : blocks placed by the coexistence search
+      n_fallback : blocks placed by empty-bay fallback while still within budget
+      n_timedout : blocks pushed to fallback because the time budget was used up
     """
     t_start = time.time()
     budget = timelimit * 0.90
+    n_coexist = n_fallback = n_timedout = 0
 
     bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
     blocks = prob_info["blocks"]
@@ -298,12 +313,21 @@ def solve_greedy(prob_info: dict, timelimit: float = 60.0,
     wload = [0.0] * n_bays
     assignments: list[dict] = []
 
-    for bid in order:
+    n_total = len(order)
+    for rank, bid in enumerate(order):
         blk = blocks[bid]
         r, p = blk["release_time"], blk["processing_time"]
         prefs = blk["bay_preferences"]
         s_max = max(prefs)
-        out_of_time = (time.time() - t_start) > budget
+        now = time.time()
+        out_of_time = (now - t_start) > budget
+
+        # Cumulative "pace" deadline: by the time block `rank` is done we should
+        # have spent at most this fraction of the budget.  A block may run until
+        # this wall-clock time, so fast early blocks bank slack for later/harder
+        # ones, and the search only bails when we fall behind the overall pace --
+        # easy instances finishing well within budget never bail.
+        blk_deadline = t_start + budget * (rank + 1) / n_total
 
         best = None  # (key, bay, oi, x, y, entry, exit_t)
         if not out_of_time:
@@ -313,7 +337,7 @@ def solve_greedy(prob_info: dict, timelimit: float = 60.0,
                 if j not in fit[bid]:
                     continue
                 res = _earliest_coexist(bays[j], placed[j], scheds[j], blocks, geom,
-                                        bid, r, p, max_entries, max_pos)
+                                        bid, r, p, max_entries, max_pos, blk_deadline)
                 if res is None:
                     continue
                 oi, x, y, entry, exit_t = res
@@ -321,7 +345,11 @@ def solve_greedy(prob_info: dict, timelimit: float = 60.0,
                 if best is None or key < best[0]:
                     best = (key, j, oi, x, y, entry, exit_t)
 
-        if best is None:
+        if best is not None:
+            n_coexist += 1
+        else:
+            n_timedout += int(out_of_time)
+            n_fallback += int(not out_of_time)
             # Fallback: empty-bay window (always feasible).  Pick the bay whose
             # empty window finishes earliest.
             fb = None
@@ -345,6 +373,9 @@ def solve_greedy(prob_info: dict, timelimit: float = 60.0,
             "orient_idx": oi, "entry_time": int(entry), "exit_time": int(exit_t),
         })
 
+    if stats is not None:
+        stats.update(n_coexist=n_coexist, n_fallback=n_fallback,
+                     n_timedout=n_timedout)
     return {"operations": _build_operations(assignments)}
 
 

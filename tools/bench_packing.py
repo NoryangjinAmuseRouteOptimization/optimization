@@ -99,19 +99,31 @@ def _nfp_candidates(bay: Bay, placed: list[Block], g: placement.OrientGeom,
     return placement.nfp_candidate_positions(bay, placed, g, max_candidates=max_cand)
 
 
+def _skyline_candidates(bay: Bay, placed: list[Block], g: placement.OrientGeom,
+                        max_cand):
+    return placement.skyline_candidate_positions(bay, placed, g, max_candidates=max_cand)
+
+
 _GENERATORS = {
     "baseline":  _baseline_candidates,
     "placement": _placement_candidates,
     "nfp":       _nfp_candidates,
+    "skyline":   _skyline_candidates,
 }
 
 
 def pack_bay(bay: Bay, block_ids: list[int], blocks_data: list[dict],
              geom: placement.GeometryCache, gen_name: str,
-             budget: float, max_cand) -> dict:
+             budget: float, max_cand, strategy: str = "first") -> dict:
     """
     First-Fit-Decreasing packing of block_ids into a single bay, all sharing the
     time window [0, 1).  Returns metrics dict.
+
+    strategy = "first"  -> take the first feasible candidate (generator order).
+    strategy = "best"   -> among ALL feasible candidates (over every orientation)
+                           pick the one with least skyline waste (best-fit).  The
+                           skyline is used only as a scoring oracle; candidates
+                           still come polygon-precise from the chosen generator.
     """
     gen = _GENERATORS[gen_name]
 
@@ -125,26 +137,41 @@ def pack_bay(bay: Bay, block_ids: list[int], blocks_data: list[dict],
     for bid in block_ids:
         if time.time() - t0 > budget:
             break
+        sky = placement.Skyline.from_blocks(bay, placed) if strategy == "best" else None
+        best = None          # (waste, oi, x, y) for best strategy
         done = False
         for oi in _orient_by_area(geom, bid):
             g = geom.geom(bid, oi)
             if not placement.fits_in_bay(bay, g):
                 continue
+            lx0, ly0, lx1, ly1 = g.bbox
             for (x, y) in gen(bay, placed, g, max_cand):
                 cand_examined += 1
                 nb = Block(block_id=bid, block_data=blocks_data[bid],
                            x=x, y=y, orient_idx=oi)
                 if not bay.contains_block(nb):
                     continue
-                if placement.can_place(bay, placed, scheds, nb, 0, 1):
-                    placed.append(nb)
-                    scheds.append((0, 1))
+                if not placement.can_place(bay, placed, scheds, nb, 0, 1):
+                    continue
+                if strategy == "first":
+                    placed.append(nb); scheds.append((0, 1))
                     placed_area += footprint_area(blocks_data, bid, oi)
                     n_placed += 1
                     done = True
                     break
+                else:
+                    w = sky.waste(x + lx0, x + lx1, y + ly0)
+                    if best is None or w < best[0]:
+                        best = (w, oi, x, y)
             if done:
                 break
+        if strategy == "best" and best is not None:
+            _, oi, x, y = best
+            placed.append(Block(block_id=bid, block_data=blocks_data[bid],
+                                x=x, y=y, orient_idx=oi))
+            scheds.append((0, 1))
+            placed_area += footprint_area(blocks_data, bid, oi)
+            n_placed += 1
 
     elapsed = time.time() - t0
     bay_area = bay.width * bay.height
@@ -157,7 +184,7 @@ def pack_bay(bay: Bay, block_ids: list[int], blocks_data: list[dict],
 
 
 def run_instance(prob_info: dict, gens: list[str], budget: float,
-                 cap: int | None, max_cand):
+                 cap: int | None, max_cand, strategy: str = "first"):
     bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
     geom = placement.GeometryCache(prob_info)
     blocks_data = prob_info["blocks"]
@@ -173,7 +200,7 @@ def run_instance(prob_info: dict, gens: list[str], budget: float,
     if cap:
         order = order[:cap]
 
-    out = {g: pack_bay(big, order, blocks_data, geom, g, budget, max_cand)
+    out = {g: pack_bay(big, order, blocks_data, geom, g, budget, max_cand, strategy)
            for g in gens}
     out["bay"] = f"{big.width}x{big.height}"
     out["n_try"] = len(order)
@@ -192,6 +219,9 @@ def main():
                     help="per-generator time budget per instance (s)")
     ap.add_argument("--max-cand", type=int, default=400,
                     help="cap on candidates per orientation (0 = unlimited)")
+    ap.add_argument("--strategy", choices=["first", "best"], default="first",
+                    help="first = first feasible candidate; "
+                         "best = least-skyline-waste feasible candidate (best-fit)")
     args = ap.parse_args()
 
     gens = [g.strip() for g in args.gens.split(",") if g.strip()]
@@ -214,7 +244,7 @@ def main():
     n = 0
     for f in files:
         prob = json.load(open(f))
-        r = run_instance(prob, gens, args.budget, cap, max_cand)
+        r = run_instance(prob, gens, args.budget, cap, max_cand, args.strategy)
         row = f"{prob['name']:10s} {r['bay']:9s} {r['n_try']:4d} |"
         for g in gens:
             m = r[g]

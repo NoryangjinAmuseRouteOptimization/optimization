@@ -288,6 +288,153 @@ def nfp_candidate_positions(bay: Bay,
 
 
 # =============================================================================
+# Skyline candidate generation (bottom-left-fill, best-fit by wasted area)
+# =============================================================================
+
+class Skyline:
+    """
+    Bounding-box upper-envelope of a bay, for bottom-left-fill packing.
+
+    The skyline is the piecewise-constant top contour of the placed blocks'
+    bounding boxes: at every x in [0, width) it stores the highest occupied y.
+    A new block "drops" onto this contour and rests at the highest contour value
+    over the x-span it covers.  This is the classic strip-packing skyline
+    (Jylanki), which suits the thin/wide bays in this competition.
+
+    Limitation: the contour treats space *under* a floating block as occupied,
+    so it will not place into pockets hidden beneath other blocks.  That is the
+    well-known skyline trade-off; can_place still validates polygon precision,
+    and the corner-point / NFP generators cover pocket placements when needed.
+
+    Segments are [x_left, x_right, y], kept sorted, contiguous over [0, width),
+    and merged when adjacent heights are equal.
+    """
+    __slots__ = ("width", "height", "segs")
+
+    def __init__(self, width: float, height: float):
+        self.width = float(width)
+        self.height = float(height)
+        self.segs: list[list[float]] = [[0.0, float(width), 0.0]]
+
+    @classmethod
+    def from_blocks(cls, bay: Bay, blocks: list[Block]) -> "Skyline":
+        sky = cls(bay.width, bay.height)
+        for b in blocks:
+            x0, _, x1, y1 = b.bounding_rect()
+            sky.raise_over(x0, x1, y1)
+        return sky
+
+    def _split_at(self, x: float) -> None:
+        """Ensure a segment breakpoint exactly at x (no-op if already present)."""
+        for i, s in enumerate(self.segs):
+            if s[0] < x < s[1]:
+                self.segs.insert(i + 1, [x, s[1], s[2]])
+                s[1] = x
+                return
+
+    def raise_over(self, a: float, b: float, h: float) -> None:
+        """Raise the contour to at least height h over the x-range [a, b)."""
+        a = max(0.0, a)
+        b = min(self.width, b)
+        if b <= a:
+            return
+        self._split_at(a)
+        self._split_at(b)
+        for s in self.segs:
+            if s[0] >= a - 1e-9 and s[1] <= b + 1e-9 and h > s[2]:
+                s[2] = h
+        self._merge()
+
+    def _merge(self) -> None:
+        out = [self.segs[0]]
+        for s in self.segs[1:]:
+            if abs(s[2] - out[-1][2]) < 1e-9 and abs(s[0] - out[-1][1]) < 1e-9:
+                out[-1][1] = s[1]
+            else:
+                out.append(s)
+        self.segs = out
+
+    def rest_y(self, xl: float, xr: float) -> float:
+        """Highest contour value over [xl, xr) -- where a block bbox would rest."""
+        h = 0.0
+        for s in self.segs:
+            if s[1] <= xl + 1e-9 or s[0] >= xr - 1e-9:
+                continue
+            if s[2] > h:
+                h = s[2]
+        return h
+
+    def waste(self, xl: float, xr: float, ry: float) -> float:
+        """Trapped gap area below a block bbox [xl,xr] resting at height ry."""
+        w = 0.0
+        for s in self.segs:
+            lo = max(s[0], xl)
+            hi = min(s[1], xr)
+            if hi <= lo:
+                continue
+            w += (ry - s[2]) * (hi - lo)
+        return w
+
+
+def skyline_candidate_positions(bay: Bay,
+                                placed_blocks: list[Block],
+                                g: OrientGeom,
+                                max_candidates: int | None = None) -> list[tuple[int, int]]:
+    """
+    Bottom-left-fill candidates ordered by BEST-FIT (least wasted area first).
+
+    Builds the bbox skyline of `placed_blocks`, then for each contour breakpoint
+    proposes a left-aligned and a right-aligned resting position for the block.
+    Each position is scored by the trapped gap area beneath the block; the list
+    is returned sorted by (waste, resting y, x).  Because positions are returned
+    in best-fit order, a caller that takes the FIRST feasible candidate gets a
+    best-fit placement -- no change to the caller's first-feasible loop needed.
+
+    Unlike candidate_positions/nfp (which return geometric anchors in spatial
+    order), this generator embeds the packing strategy in the ORDER.
+    """
+    lx0, ly0, lx1, ly1 = g.bbox
+    bw = lx1 - lx0
+    bh = ly1 - ly0
+    sky = Skyline.from_blocks(bay, placed_blocks)
+
+    # Candidate bbox-left x positions: each contour breakpoint (left-align) and
+    # each breakpoint minus block width (right-align against a segment end).
+    bbox_lefts: set[float] = set()
+    for s in sky.segs:
+        bbox_lefts.add(s[0])
+        bbox_lefts.add(s[1] - bw)
+
+    scored: list[tuple[float, int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for bl in bbox_lefts:
+        if bl < -1e-9 or bl + bw > bay.width + 1e-9:
+            continue
+        ry = sky.rest_y(bl, bl + bw)
+        if ry + bh > bay.height + 1e-9:
+            continue
+        # Reference point so that bbox bottom-left sits at (bl, ry).
+        x = math.ceil(bl - lx0)
+        y = math.ceil(ry - ly0)
+        if x + lx0 < -1e-9 or x + lx1 > bay.width + 1e-9:
+            continue
+        if y + ly0 < -1e-9 or y + ly1 > bay.height + 1e-9:
+            continue
+        key = (int(x), int(y))
+        if key in seen:
+            continue
+        seen.add(key)
+        w = sky.waste(x + lx0, x + lx1, y + ly0)
+        scored.append((w, int(y), int(x)))
+
+    scored.sort()  # best-fit: least waste, then lowest, then left-most
+    result = [(c[2], c[1]) for c in scored]
+    if max_candidates is not None:
+        result = result[:max_candidates]
+    return result
+
+
+# =============================================================================
 # Feasibility predicate (delegates to the evaluator's exact geometry)
 # =============================================================================
 

@@ -20,14 +20,15 @@
 ### M0 — 준비 (~6/15 예선 시작)
 - [x] 문제 정의·평가 방식 파악 (problem statement v1.1)
 - [x] baseline 코드·훈련 데이터 리포지토리 정리
-- [ ] 로컬 실행 환경 구축 (`conda env create -f ogc2026_env.yml`)
-- [ ] baseline을 40개 훈련 인스턴스에 돌려 기준 점수(objective) 측정
-- [ ] 벤치마크 스크립트 작성 (전 인스턴스 자동 실행 + 결과 집계)
+- [x] 벤치마크 스크립트 작성 (전 인스턴스 자동 실행 + 결과 집계) — `tools/bench_solver.py`
+- [x] 40개 인스턴스 기준 점수 측정 — baseline은 **제출 불가 판명**(시간초과+infeasible)
 
 ### M1 — 베이스라인 분석 & 첫 제출 (예선 1주차, ~6/22)
-- [ ] greedy 알고리즘 병목/약점 분석 (어떤 인스턴스에서 infeasible·고비용인지)
-- [ ] 목적함수 3요소(tardiness/imbalance/preference)별 기여도 분석
-- [ ] baseline 그대로 첫 제출 → 리더보드 위치 확인 (제출 쿨다운 12시간 유의)
+- [x] greedy 알고리즘 병목/약점 분석 — baseline 시간가드 붕괴, stage-5 실패 규명
+- [x] 목적함수 3요소 기여도 분석 — **obj1(tardiness) 지배적**(w1≈1.3~2.9만)
+- [x] 제출 가능한 솔버 확보 — `solver.solve_greedy` 40/40 feasible, floor 대비 4.8×
+- [x] 제출 패키지 자동화·검증 — `tools/build_submission.py` (격리 feasibility 통과)
+- [ ] **첫 제출 발송** → 리더보드 위치 확인 (쿨다운 12시간 유의) ⬅ 다음 액션
 
 ### M2 — 알고리즘 개선 (예선 2~4주차, ~7/13)
 - [ ] 공간 배치 개선 (no-fit polygon / bottom-left 외 휴리스틱)
@@ -37,10 +38,10 @@
 - [ ] MIP 솔버(Gurobi/Xpress) 활용 가능 부분 검토
 
 ### M3 — 튜닝 & 안정화 (예선 5~6주차, ~7/27)
-- [ ] 시간제한(수분~30분) 내 동작 보장 — 내부 elapsed 모니터링
+- [x] 시간제한 내 동작 보장 — solver 시간예산(0.9·limit)+순차 폴백
 - [ ] 4코어/16GB 자원 제약 대응 (병렬화 검토)
 - [ ] 엣지케이스 견고성 (대형 인스턴스 300블록, 타이트한 납기)
-- [ ] 제출 패키지 검증 (myalgorithm.py 루트 위치, 15MB 이하, utils.py 미수정)
+- [x] 제출 패키지 검증 (myalgorithm.py 루트 위치, 15MB 이하, utils.py 미수정)
 
 ### M4 — 예선 마감 (7/28 14:00)
 - [ ] 최종 제출 확정 (마감 전 충분한 여유, 쿨다운 고려)

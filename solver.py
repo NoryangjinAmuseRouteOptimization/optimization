@@ -40,6 +40,7 @@ coexistence (via placement.can_place) to cut tardiness is the next step (P2).
 from __future__ import annotations
 
 import sys
+import time
 import pathlib
 
 # Make utils / placement importable whether called from repo root or elsewhere.
@@ -48,8 +49,8 @@ for _p in (_HERE, _HERE / "baseline"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from utils import Bay  # noqa: E402
-import placement       # noqa: E402
+from utils import Bay, Block, check_entry, check_exit, check_collisions  # noqa: E402
+import placement                                                          # noqa: E402
 
 
 def _build_operations(assignments: list[dict]) -> dict:
@@ -165,6 +166,188 @@ def solve(prob_info: dict, timelimit: float = 60.0) -> dict:
     return {"operations": _build_operations(assignments)}
 
 
+# =============================================================================
+# Coexistence-aware greedy (feasible by construction, time-budgeted)
+# =============================================================================
+
+def _empty_window(scheds: list[tuple[int, int]], release: int, proc: int) -> int:
+    """Earliest entry >= release with the bay empty for the whole [entry, entry+proc)."""
+    entry = int(release)
+    changed = True
+    while changed:
+        changed = False
+        for a, e in scheds:
+            if entry < e and a < entry + proc:   # overlap with this slot
+                entry = max(entry, e)
+                changed = True
+    return entry
+
+
+def _feasible_insert(bay: Bay,
+                     placed: list[Block], scheds: list[tuple[int, int]],
+                     nb: Block, entry: int, exit_t: int) -> bool:
+    """
+    True iff inserting nb over [entry, exit_t) keeps the WHOLE solution feasible
+    (matches every stage of check_feasibility, including Stage-5 same-time
+    ordering).  Feasibility-by-construction relies on this being complete.
+
+    For each already-placed block A=(eA, xA) we check, order-independently:
+      * collision while co-present:            check_collisions(nb, A)
+      * nb descends through A (A present @ nb entry): check_entry([A], nb)
+      * A descends through nb (nb present @ A entry): check_entry([nb], A)
+      * nb ascends through A (A present @ nb exit):   check_exit([A], nb)
+      * A ascends through nb (nb present @ A exit):    check_exit([nb], A)
+
+    Boundary handling (the Stage-5 fix): blocks that share an ENTRY time both
+    descend "at the same instant", so we check BOTH descent directions (<= on the
+    shared boundary); likewise shared EXIT times check both ascent directions.
+    Cases where one block's exit equals another's entry are excluded (EXIT is
+    always sequenced before ENTRY at a time point, so the bay is free in time).
+    This is conservative -- it may reject a same-time arrangement that some
+    operation order would accept -- which only costs a little packing, never
+    feasibility.
+    """
+    if not bay.contains_block(nb):
+        return False
+    for A, (eA, xA) in zip(placed, scheds):
+        # Stage-4 collision while intervals overlap (open).
+        if entry < xA and eA < exit_t and check_collisions(bay, [nb, A]):
+            return False
+        # Crane descent: A present at nb's entry (eA <= entry < xA).
+        if eA <= entry < xA and check_entry(bay, [A], nb, fast=True):
+            return False
+        # Crane descent: nb present at A's entry (entry <= eA < exit_t).
+        if entry <= eA < exit_t and check_entry(bay, [nb], A, fast=True):
+            return False
+        # Crane ascent: A present at nb's exit (eA < exit_t <= xA).
+        if eA < exit_t <= xA and check_exit(bay, [A], nb, fast=True):
+            return False
+        # Crane ascent: nb present at A's exit (entry < xA <= exit_t).
+        if entry < xA <= exit_t and check_exit(bay, [nb], A, fast=True):
+            return False
+    return True
+
+
+def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int]],
+                      blocks_data: list[dict], geom: placement.GeometryCache,
+                      bid: int, release: int, proc: int,
+                      max_entries: int, max_pos: int):
+    """
+    Earliest feasible coexisting placement of block bid in `bay`.
+    Returns (orient_idx, x, y, entry, exit_t) or None.
+
+    Candidate entry times = {release} U {exit times in bay > release}; for each
+    (ascending) we take the first feasible (orientation, position).  Earliest
+    entry minimizes the block's exit and hence its tardiness.
+    """
+    cand_entries = sorted({release} | {e for _, e in scheds if e > release})[:max_entries]
+    orients = sorted(range(geom.n_orient(bid)),
+                     key=lambda oi: (lambda g: g.width * g.height)(geom.geom(bid, oi)))
+    for entry in cand_entries:
+        exit_t = entry + proc
+        for oi in orients:
+            g = geom.geom(bid, oi)
+            if not placement.fits_in_bay(bay, g):
+                continue
+            relevant = [pb for pb, (s, e) in zip(placed, scheds)
+                        if placement._time_overlaps(entry, exit_t, s, e)]
+            for (x, y) in placement.candidate_positions(bay, relevant, g, max_pos):
+                nb = Block(block_id=bid, block_data=blocks_data[bid],
+                           x=x, y=y, orient_idx=oi)
+                if _feasible_insert(bay, placed, scheds, nb, entry, exit_t):
+                    return oi, x, y, entry, exit_t
+    return None
+
+
+def solve_greedy(prob_info: dict, timelimit: float = 60.0,
+                 max_entries: int = 16, max_pos: int = 40) -> dict:
+    """
+    Coexistence-aware greedy: place EDD-ordered blocks at the earliest time/bay
+    that keeps the solution feasible (blocks may share a bay when spatially
+    compatible), cutting the tardiness that the pure-sequential solver incurs.
+
+    Feasible by construction (only can_place + _obstructs_others-validated
+    placements are committed) -- no repair loop, so it can never emit an
+    infeasible solution.  A strict wall-clock budget falls back to the always-
+    feasible empty-bay window for any remaining blocks, so the time limit is
+    never exceeded.
+    """
+    t_start = time.time()
+    budget = timelimit * 0.90
+
+    bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
+    blocks = prob_info["blocks"]
+    n_bays = len(bays)
+    geom = placement.GeometryCache(prob_info)
+
+    areas = [b.width * b.height for b in bays]
+    avg_area = sum(areas) / n_bays
+    u = [avg_area / a for a in areas]
+
+    # Per-block fitting placement for the empty-bay fallback.
+    fit: dict[int, dict[int, tuple]] = {}
+    for bid in range(len(blocks)):
+        fit[bid] = {j: r for j in range(n_bays)
+                    if (r := _fitting_orientation(bays[j], geom, bid)) is not None}
+
+    order = sorted(range(len(blocks)),
+                   key=lambda i: (blocks[i]["due_date"], blocks[i]["processing_time"]))
+
+    placed: list[list[Block]] = [[] for _ in range(n_bays)]
+    scheds: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
+    wload = [0.0] * n_bays
+    assignments: list[dict] = []
+
+    for bid in order:
+        blk = blocks[bid]
+        r, p = blk["release_time"], blk["processing_time"]
+        prefs = blk["bay_preferences"]
+        s_max = max(prefs)
+        out_of_time = (time.time() - t_start) > budget
+
+        best = None  # (key, bay, oi, x, y, entry, exit_t)
+        if not out_of_time:
+            # Try every bay; prefer the earliest finish (min exit), then
+            # preference, then lighter load.
+            for j in range(n_bays):
+                if j not in fit[bid]:
+                    continue
+                res = _earliest_coexist(bays[j], placed[j], scheds[j], blocks, geom,
+                                        bid, r, p, max_entries, max_pos)
+                if res is None:
+                    continue
+                oi, x, y, entry, exit_t = res
+                key = (exit_t, s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                if best is None or key < best[0]:
+                    best = (key, j, oi, x, y, entry, exit_t)
+
+        if best is None:
+            # Fallback: empty-bay window (always feasible).  Pick the bay whose
+            # empty window finishes earliest.
+            fb = None
+            for j, (oi, x, y) in fit[bid].items():
+                entry = _empty_window(scheds[j], r, p)
+                exit_t = entry + p
+                key = (exit_t, s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                if fb is None or key < fb[0]:
+                    fb = (key, j, oi, x, y, entry, exit_t)
+            if fb is None:  # degenerate instance
+                j = 0; entry = _empty_window(scheds[0], r, p)
+                fb = ((0,), 0, 0, 0, 0, entry, entry + p)
+            best = fb
+
+        _, j, oi, x, y, entry, exit_t = best
+        placed[j].append(Block(block_id=bid, block_data=blk, x=x, y=y, orient_idx=oi))
+        scheds[j].append((entry, exit_t))
+        wload[j] += u[j] * blk["workload"]
+        assignments.append({
+            "block_id": bid, "bay_id": j, "x": int(x), "y": int(y),
+            "orient_idx": oi, "entry_time": int(entry), "exit_time": int(exit_t),
+        })
+
+    return {"operations": _build_operations(assignments)}
+
+
 # Submission entry point shim (mirrors myalgorithm.algorithm signature).
 def algorithm(prob_info: dict, timelimit: float = 60.0) -> dict:
-    return solve(prob_info, timelimit)
+    return solve_greedy(prob_info, timelimit)

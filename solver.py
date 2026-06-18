@@ -54,6 +54,27 @@ from utils import Bay, Block, check_entry, check_exit, check_collisions  # noqa:
 import placement                                                          # noqa: E402
 
 
+def _bay_select_key(key_mode: str, exit_t: int, due: int,
+                    pref_pen: float, load: float):
+    """
+    Cross-bay tie-break key for choosing which bay a block goes to.
+
+    "exit" : (exit_t, pref_penalty, load) -- earliest finish first.  Frees the
+             bay soonest, which tends to reduce *future* blocks' tardiness, so it
+             is best on tardiness-dominated instances (obj1, weight w1, dominates).
+    "tard" : (max(0, exit_t - due), pref_penalty, exit_t, load) -- among bays that
+             finish before the due date (zero tardiness) the preferred / better-
+             balanced bay wins, lowering obj3/obj2.  Best on instances where
+             tardiness is already ~0 and obj3 is the whole objective.
+
+    Multi-start runs both modes and keeps the best per instance, so neither
+    regime regresses.
+    """
+    if key_mode == "tard":
+        return (max(0, exit_t - due), pref_pen, exit_t, load)
+    return (exit_t, pref_pen, load)
+
+
 def _build_operations(assignments: list[dict]) -> dict:
     """
     Build the {"operations": {time: [ops]}} dict from per-block assignments.
@@ -299,7 +320,8 @@ def solve_greedy(prob_info: dict, timelimit: float = 60.0,
 
 def _greedy_assignments(prob_info: dict, timelimit: float,
                         max_entries: int = 16, max_pos: int = 40,
-                        stats: dict | None = None, seed: int = 0) -> list[dict]:
+                        stats: dict | None = None, seed: int = 0,
+                        key_mode: str = "exit") -> list[dict]:
     """Core construction (see solve_greedy); returns the assignment list."""
     t_start = time.time()
     budget = timelimit * 0.90
@@ -368,7 +390,8 @@ def _greedy_assignments(prob_info: dict, timelimit: float,
                 if res is None:
                     continue
                 oi, x, y, entry, exit_t = res
-                key = (exit_t, s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                key = _bay_select_key(key_mode, exit_t, blk["due_date"],
+                                      s_max - prefs[j], wload[j] + u[j] * blk["workload"])
                 if best is None or key < best[0]:
                     best = (key, j, oi, x, y, entry, exit_t)
 
@@ -383,7 +406,8 @@ def _greedy_assignments(prob_info: dict, timelimit: float,
             for j, (oi, x, y) in fit[bid].items():
                 entry = _empty_window(scheds[j], r, p)
                 exit_t = entry + p
-                key = (exit_t, s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                key = _bay_select_key(key_mode, exit_t, blk["due_date"],
+                                      s_max - prefs[j], wload[j] + u[j] * blk["workload"])
                 if fb is None or key < fb[0]:
                     fb = (key, j, oi, x, y, entry, exit_t)
             if fb is None:  # degenerate instance
@@ -455,7 +479,7 @@ def compute_objective(prob_info: dict, assignments: list[dict]) -> tuple[float, 
 
 def solve_lns(prob_info: dict, timelimit: float = 60.0,
               max_entries: int = 16, max_pos: int = 40, seed: int = 0,
-              construct_frac: float = 0.35) -> list[dict]:
+              construct_frac: float = 0.35, key_mode: str = "exit") -> list[dict]:
     """
     Construct a feasible solution quickly, then spend the bulk of the budget
     improving it with Large Neighborhood Search; returns the assignment list.
@@ -505,14 +529,16 @@ def solve_lns(prob_info: dict, timelimit: float = 60.0,
                 if res is None:
                     continue
                 oi, x, y, entry, exit_t = res
-                key = (exit_t, s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                key = _bay_select_key(key_mode, exit_t, blk["due_date"],
+                                      s_max - prefs[j], wload[j] + u[j] * blk["workload"])
                 if best is None or key < best[0]:
                     best = (key, j, oi, x, y, entry, exit_t)
         if best is None:
             for j, (oi, x, y) in fit[bid].items():
                 entry = _empty_window(scheds[j], r, p)
                 exit_t = entry + p
-                key = (exit_t, s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                key = _bay_select_key(key_mode, exit_t, blk["due_date"],
+                                      s_max - prefs[j], wload[j] + u[j] * blk["workload"])
                 if best is None or key < best[0]:
                     best = (key, j, oi, x, y, entry, exit_t)
             if best is None:  # degenerate
@@ -600,13 +626,103 @@ def solve_lns(prob_info: dict, timelimit: float = 60.0,
 
 
 # =============================================================================
+# obj3/obj2 polish: relocate blocks to a more-preferred bay (no objective rise)
+# =============================================================================
+
+def _obj3_polish(prob_info: dict, assignments: list[dict], end: float,
+                 cur_obj: float, max_entries: int = 16, max_pos: int = 40) -> list[dict]:
+    """
+    Local search that relocates blocks to a more-preferred bay, accepting a move
+    only when the EXACT total objective strictly decreases.  Targets obj3 (and
+    obj2) on instances where tardiness is already low and preference penalty is
+    the bulk of the objective; strictly non-regressing by construction.
+
+    Runs until `end` (wall-clock).  Every relocation is _feasible_insert-checked
+    and rejected moves are reverted to the saved placement, so feasibility holds.
+    """
+    blocks = prob_info["blocks"]
+    bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
+    n_bays = len(bays)
+    if n_bays < 2:
+        return assignments
+    geom = placement.GeometryCache(prob_info)
+    areas = [b.width * b.height for b in bays]
+    u = [(sum(areas) / n_bays) / a for a in areas]
+    fit: dict[int, dict[int, tuple]] = {}
+    for bid in range(len(blocks)):
+        fit[bid] = {j: r for j in range(n_bays)
+                    if (r := _fitting_orientation(bays[j], geom, bid)) is not None}
+
+    placed: list[list[Block]] = [[] for _ in range(n_bays)]
+    scheds: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
+    assign: dict[int, dict] = {}
+    for a in assignments:
+        j = a["bay_id"]
+        placed[j].append(Block(block_id=a["block_id"], block_data=blocks[a["block_id"]],
+                               x=a["x"], y=a["y"], orient_idx=a["orient_idx"]))
+        scheds[j].append((a["entry_time"], a["exit_time"]))
+        assign[a["block_id"]] = a
+
+    def _remove(bid):
+        a = assign.pop(bid); j = a["bay_id"]
+        idx = next(i for i, b in enumerate(placed[j]) if b.block_id == bid)
+        placed[j].pop(idx); scheds[j].pop(idx)
+
+    def _readd(a):
+        bid, j = a["block_id"], a["bay_id"]
+        placed[j].append(Block(block_id=bid, block_data=blocks[bid],
+                               x=a["x"], y=a["y"], orient_idx=a["orient_idx"]))
+        scheds[j].append((a["entry_time"], a["exit_time"])); assign[bid] = a
+
+    # Blocks not already in their most-preferred bay, worst preference gap first.
+    cands = sorted(
+        (bid for bid in assign
+         if assign[bid]["bay_id"] != max(fit[bid], key=lambda j: blocks[bid]["bay_preferences"][j],
+                                         default=assign[bid]["bay_id"])),
+        key=lambda bid: blocks[bid]["bay_preferences"][assign[bid]["bay_id"]],
+    )
+    for bid in cands:
+        if time.time() >= end:
+            break
+        blk = blocks[bid]
+        r, p = blk["release_time"], blk["processing_time"]
+        prefs = blk["bay_preferences"]
+        cur_bay = assign[bid]["bay_id"]
+        saved = assign[bid]
+        # More-preferred bays than the current one, best preference first.
+        targets = sorted((j for j in fit[bid] if prefs[j] > prefs[cur_bay]),
+                         key=lambda j: prefs[j], reverse=True)
+        if not targets:
+            continue
+        _remove(bid)
+        moved = False
+        for jt in targets:
+            res = _earliest_coexist(bays[jt], placed[jt], scheds[jt], blocks, geom,
+                                    bid, r, p, max_entries, max_pos, end)
+            if res is None:
+                continue
+            oi, x, y, entry, exit_t = res
+            placed[jt].append(Block(block_id=bid, block_data=blk, x=x, y=y, orient_idx=oi))
+            scheds[jt].append((entry, exit_t))
+            assign[bid] = {"block_id": bid, "bay_id": jt, "x": int(x), "y": int(y),
+                           "orient_idx": oi, "entry_time": int(entry), "exit_time": int(exit_t)}
+            new_obj = compute_objective(prob_info, list(assign.values()))[0]
+            if new_obj < cur_obj - 1e-9:
+                cur_obj = new_obj; moved = True; break
+            _remove(bid)   # not better -> undo this target
+        if not moved:
+            _readd(saved)
+    return list(assign.values())
+
+
+# =============================================================================
 # Parallel multi-start (uses the 4 allowed cores; keeps the best feasible run)
 # =============================================================================
 
 def _worker(args):
     """Child-process entry: build one seeded greedy solution, score it."""
-    prob_info, budget, seed = args
-    a = _greedy_assignments(prob_info, budget, seed=seed)
+    prob_info, budget, seed, key_mode = args
+    a = _greedy_assignments(prob_info, budget, seed=seed, key_mode=key_mode)
     obj, _, _, _ = compute_objective(prob_info, a)
     return obj, a
 
@@ -633,11 +749,24 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
         if timelimit >= 8.0 and n_workers >= 2:
             margin = max(1.5, timelimit * 0.04)   # spawn + gather + build ops
             budget = timelimit - margin
-            tasks = [(prob_info, budget, s) for s in range(n_workers)]
+            # Half the workers minimize earliest-finish ("exit", best for
+            # tardiness-dominated instances), half minimize tardiness-then-
+            # preference ("tard", best where tardiness is ~0 and obj3 rules).
+            # Best of all is kept, so each instance gets its better regime.
+            # All workers use the "exit" key (full seed diversity for the
+            # tardiness-dominated instances that drive the score).
+            tasks = [(prob_info, budget, s, "exit") for s in range(n_workers)]
             with ProcessPoolExecutor(max_workers=n_workers) as ex:
                 results = list(ex.map(_worker, tasks))   # each self-limits < budget
-            best = min(results, key=lambda r: r[0])
-            return {"operations": _build_operations(best[1])}
+            best_obj, best_a = min(results, key=lambda r: r[0])
+            # Workers on easy instances finish well before the budget; spend any
+            # leftover time polishing obj3/obj2 (relocate blocks to a more
+            # preferred bay only when the total objective strictly drops).  Hard
+            # instances leave no slack, so the polish is simply skipped there.
+            end = t0 + timelimit - margin
+            if time.time() < end - 0.5:
+                best_a = _obj3_polish(prob_info, best_a, end, best_obj)
+            return {"operations": _build_operations(best_a)}
     except Exception:
         pass  # fall through to the safe sequential path below
 

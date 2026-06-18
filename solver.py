@@ -40,6 +40,7 @@ coexistence (via placement.can_place) to cut tardiness is the next step (P2).
 from __future__ import annotations
 
 import sys
+import math
 import time
 import pathlib
 
@@ -100,7 +101,7 @@ def _fitting_orientation(bay: Bay, geom: placement.GeometryCache, bid: int):
     return oi, x, y
 
 
-def solve(prob_info: dict, timelimit: float = 60.0) -> dict:
+def solve_sequential(prob_info: dict, timelimit: float = 60.0) -> dict:
     """
     Guaranteed-feasible, time-safe solver (see module docstring).
 
@@ -270,7 +271,7 @@ def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int
 
 def solve_greedy(prob_info: dict, timelimit: float = 60.0,
                  max_entries: int = 16, max_pos: int = 40,
-                 stats: dict | None = None) -> dict:
+                 stats: dict | None = None, seed: int = 0) -> dict:
     """
     Coexistence-aware greedy: place EDD-ordered blocks at the earliest time/bay
     that keeps the solution feasible (blocks may share a bay when spatially
@@ -281,11 +282,25 @@ def solve_greedy(prob_info: dict, timelimit: float = 60.0,
     A strict wall-clock budget falls back to the always-feasible empty-bay window
     for any remaining blocks, so the time limit is never exceeded.
 
+    `seed` perturbs the processing order for multi-start diversity: seed 0 is
+    pure EDD (due_date, processing_time); seed > 0 adds bounded random jitter to
+    the due-date key so near-due blocks may swap, exploring different schedules
+    while staying close to EDD.
+
     If `stats` (a dict) is passed it is filled with diagnostics:
       n_coexist  : blocks placed by the coexistence search
       n_fallback : blocks placed by empty-bay fallback while still within budget
       n_timedout : blocks pushed to fallback because the time budget was used up
     """
+    assignments = _greedy_assignments(prob_info, timelimit, max_entries, max_pos,
+                                      stats, seed)
+    return {"operations": _build_operations(assignments)}
+
+
+def _greedy_assignments(prob_info: dict, timelimit: float,
+                        max_entries: int = 16, max_pos: int = 40,
+                        stats: dict | None = None, seed: int = 0) -> list[dict]:
+    """Core construction (see solve_greedy); returns the assignment list."""
     t_start = time.time()
     budget = timelimit * 0.90
     n_coexist = n_fallback = n_timedout = 0
@@ -305,8 +320,20 @@ def solve_greedy(prob_info: dict, timelimit: float = 60.0,
         fit[bid] = {j: r for j in range(n_bays)
                     if (r := _fitting_orientation(bays[j], geom, bid)) is not None}
 
-    order = sorted(range(len(blocks)),
-                   key=lambda i: (blocks[i]["due_date"], blocks[i]["processing_time"]))
+    if seed == 0:
+        order = sorted(range(len(blocks)),
+                       key=lambda i: (blocks[i]["due_date"], blocks[i]["processing_time"]))
+    else:
+        # Jittered EDD: perturb the due-date key by up to ~1 median inter-due gap
+        # so near-due blocks may reorder while the schedule stays close to EDD.
+        import random
+        rng = random.Random(seed)
+        dues = sorted(b["due_date"] for b in blocks)
+        span = (dues[-1] - dues[0]) or 1
+        jit = max(1.0, span / max(1, len(dues)))
+        order = sorted(range(len(blocks)),
+                       key=lambda i: (blocks[i]["due_date"] + rng.uniform(-jit, jit),
+                                      blocks[i]["processing_time"]))
 
     placed: list[list[Block]] = [[] for _ in range(n_bays)]
     scheds: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
@@ -376,9 +403,102 @@ def solve_greedy(prob_info: dict, timelimit: float = 60.0,
     if stats is not None:
         stats.update(n_coexist=n_coexist, n_fallback=n_fallback,
                      n_timedout=n_timedout)
-    return {"operations": _build_operations(assignments)}
+    return assignments
+
+
+# =============================================================================
+# Objective (matches utils.check_feasibility; cheap, no feasibility re-check)
+# =============================================================================
+
+def compute_objective(prob_info: dict, assignments: list[dict]) -> tuple[float, float, float, float]:
+    """
+    Compute (objective, obj1, obj2, obj3) directly from assignments, identical to
+    utils.check_feasibility's objective.  Valid only for feasible solutions --
+    which our construction guarantees -- so it needs no expensive re-check, making
+    it cheap enough to score every multi-start candidate.
+
+      obj1 = sum max(0, exit - due)
+      obj2 = floor(max_{j1!=j2} |u_j1*load_j1 - u_j2*load_j2|),  u_j=avg_area/area_j
+      obj3 = sum (max(pref_i) - pref_i[bay_i])
+    """
+    blocks = prob_info["blocks"]
+    bays = prob_info["bays"]
+    n_bays = len(bays)
+    w = prob_info.get("weights", {})
+    w1, w2, w3 = w.get("w1", 1.0), w.get("w2", 1.0), w.get("w3", 1.0)
+
+    obj1 = obj3 = 0.0
+    loads = [0.0] * n_bays
+    for a in assignments:
+        blk = blocks[a["block_id"]]
+        bj = a["bay_id"]
+        obj1 += max(0.0, a["exit_time"] - blk["due_date"])
+        loads[bj] += blk["workload"]
+        prefs = blk["bay_preferences"]
+        obj3 += max(prefs) - prefs[bj]
+
+    areas = [b["width"] * b["height"] for b in bays]
+    avg = sum(areas) / n_bays
+    u = [avg / a for a in areas]
+    if n_bays >= 2:
+        obj2 = math.floor(max(abs(u[a] * loads[a] - u[b] * loads[b])
+                              for a in range(n_bays) for b in range(n_bays) if a != b))
+    else:
+        obj2 = 0.0
+
+    return w1 * obj1 + w2 * obj2 + w3 * obj3, obj1, obj2, obj3
+
+
+# =============================================================================
+# Parallel multi-start (uses the 4 allowed cores; keeps the best feasible run)
+# =============================================================================
+
+def _worker(args):
+    """Child-process entry: build one seeded greedy solution, score it."""
+    prob_info, budget, seed = args
+    a = _greedy_assignments(prob_info, budget, seed=seed)
+    obj, _, _, _ = compute_objective(prob_info, a)
+    return obj, a
+
+
+def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
+    """
+    Parallel multi-start: run several seeded greedy constructions concurrently
+    (the competition allows up to 4 cores) and keep the lowest-objective one.
+    Each construction is feasible by construction and self-limits to its budget,
+    so the time limit is respected; any failure falls back to a single greedy
+    pass, and ultimately to the instant always-feasible sequential solver -- the
+    submission can never come back infeasible or over time.
+
+    Seed 0 is pure EDD (= the single-pass result), so multi-start never regresses
+    below it; extra seeds only add chances to improve.
+    """
+    t0 = time.time()
+    try:
+        import os
+        from concurrent.futures import ProcessPoolExecutor
+
+        n_workers = min(workers, os.cpu_count() or 1)
+        # For tiny limits the process-pool overhead is not worth it.
+        if timelimit >= 8.0 and n_workers >= 2:
+            margin = max(1.5, timelimit * 0.04)   # spawn + gather + build ops
+            budget = timelimit - margin
+            tasks = [(prob_info, budget, s) for s in range(n_workers)]
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                results = list(ex.map(_worker, tasks))   # each self-limits < budget
+            best = min(results, key=lambda r: r[0])
+            return {"operations": _build_operations(best[1])}
+    except Exception:
+        pass  # fall through to the safe sequential path below
+
+    # Fallback: single greedy pass with the remaining time (still feasible).
+    remaining = timelimit - (time.time() - t0)
+    if remaining > 1.0:
+        return solve_greedy(prob_info, remaining)
+    # Last resort: instant, always-feasible sequential schedule.
+    return solve_sequential(prob_info)
 
 
 # Submission entry point shim (mirrors myalgorithm.algorithm signature).
 def algorithm(prob_info: dict, timelimit: float = 60.0) -> dict:
-    return solve_greedy(prob_info, timelimit)
+    return solve(prob_info, timelimit)

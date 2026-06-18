@@ -72,10 +72,13 @@ def _solve_one(args: tuple) -> dict:
         solver = myalgorithm.algorithm
     elif solver_name == "sequential":
         import solver as _s
-        solver = _s.solve
+        solver = _s.solve_sequential
     elif solver_name == "greedy":
         import solver as _s
         solver = _s.solve_greedy
+    elif solver_name == "multistart":
+        import solver as _s
+        solver = _s.solve
     else:
         raise ValueError(f"unknown solver '{solver_name}'")
 

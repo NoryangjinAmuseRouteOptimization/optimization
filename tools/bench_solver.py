@@ -79,6 +79,9 @@ def _solve_one(args: tuple) -> dict:
     elif solver_name == "multistart":
         import solver as _s
         solver = _s.solve
+    elif solver_name == "lns":
+        import solver as _s
+        solver = lambda p, t: {"operations": _s._build_operations(_s.solve_lns(p, t))}
     else:
         raise ValueError(f"unknown solver '{solver_name}'")
 

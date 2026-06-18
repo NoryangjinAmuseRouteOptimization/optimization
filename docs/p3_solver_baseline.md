@@ -127,10 +127,32 @@ feasible, 시간안전, baseline(−1) 대비 확실한 양수 점수.
 | + 적응형 페이스 deadline | 2.72e9 |
 | + 병렬 멀티스타트 | **2.35e9** |
 
+## 발견 6: LNS 탐색 — 큰 인스턴스엔 유효, 4코어 한계로 기본 채택 보류
+
+`solver.solve_lns` 구현: 가장 tardy한 블록 k개 제거 → 재삽입, 개선 시 수락(아니면
+O(k) 되돌림). feasible-by-construction + known-good 복원이라 항상 feasible.
+
+측정(30s, construct_frac=0.35):
+
+| 인스턴스 | greedy(full) | LNS | 차이 |
+|---|---:|---:|---:|
+| prob_39 (250) | 2.52e8 | **1.95e8** | **+22.7%** |
+| prob_38 (250) | 1.01e9 | 9.14e8 | +9.2% |
+| prob_23 (100) | 2.75e7 | 3.92e7 | **−42.7%** |
+
+- ✅ **큰 인스턴스**: full 구성이 어차피 시간초과 → 빠른 구성+LNS 재배치가 크게 우세.
+- ❌ **작은 인스턴스**: full 구성이 이미 강함 → 구성을 줄이면 손해.
+- ⚠️ **4코어 한계**: 멀티스타트에 LNS 워커를 섞으면 full-construct **seed 다양성을
+  희생**(prob_23이 24M→37M로 퇴보). full-construct 다양성과 LNS를 4코어로 동시
+  확보 불가.
+
+→ **결정**: 퇴보를 출시하지 않는다. 기본 entry는 검증된 plain 멀티스타트(2.35e9,
+무퇴보) 유지. `solve_lns`는 독립 도구로 보존(`bench_solver.py --solver lns`).
+향후 인스턴스 크기 적응형(작으면 full-multistart, 크면 LNS) 또는 코어>4 환경에서
+재결합 가치 있음.
+
 ## 다음 레버
 
-1. **LNS/destroy-recreate** — 멀티스타트는 독립 재구성. 부분 파괴-재삽입으로
-   기존 해를 점진 개선하면 obj1 추가 절감 여지.
-2. **obj2/obj3 직접 최적화** — 현재 tardiness 위주. 배정 단계에서 부하균형·선호
-   가중을 더 정교하게.
-3. **제출 패키징** — 완료(`tools/build_submission.py`, 격리 feasibility 검증).
+1. **인스턴스 크기 적응형 디스패치** — 블록 수/시간제한으로 multistart vs LNS 선택.
+2. **obj2/obj3 직접 최적화** — 배정 단계 부하균형·선호 가중 정교화.
+3. **공존 탐색 고속화** — 더 빠른 `_feasible_insert`로 같은 시간에 더 많은 공존.

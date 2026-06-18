@@ -450,6 +450,156 @@ def compute_objective(prob_info: dict, assignments: list[dict]) -> tuple[float, 
 
 
 # =============================================================================
+# Large Neighborhood Search (destroy worst-tardiness blocks, recreate, accept)
+# =============================================================================
+
+def solve_lns(prob_info: dict, timelimit: float = 60.0,
+              max_entries: int = 16, max_pos: int = 40, seed: int = 0,
+              construct_frac: float = 0.35) -> list[dict]:
+    """
+    Construct a feasible solution quickly, then spend the bulk of the budget
+    improving it with Large Neighborhood Search; returns the assignment list.
+
+    Construction uses only `construct_frac` of the budget (a tighter pace
+    deadline) so most of the time goes to LNS.  Each LNS iteration removes the k
+    most tardy blocks (plus a few random ones for diversification), re-inserts
+    them with the coexistence search, and keeps the move only if the exact
+    objective improves (hill climbing); otherwise it reverts in O(k) to the saved
+    placements.  Every insertion is _feasible_insert-validated and every revert
+    restores known-good placements, so the solution is feasible at all times.
+    Re-optimizing only k blocks per iteration is far cheaper than a full
+    reconstruction, allowing many iterations.
+    """
+    import random
+    t_start = time.time()
+    budget = timelimit * 0.90
+    rng = random.Random(seed * 7919 + 1)
+
+    bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
+    blocks = prob_info["blocks"]
+    n_bays = len(bays)
+    geom = placement.GeometryCache(prob_info)
+    areas = [b.width * b.height for b in bays]
+    u = [(sum(areas) / n_bays) / a for a in areas]
+
+    fit: dict[int, dict[int, tuple]] = {}
+    for bid in range(len(blocks)):
+        fit[bid] = {j: r for j in range(n_bays)
+                    if (r := _fitting_orientation(bays[j], geom, bid)) is not None}
+
+    placed: list[list[Block]] = [[] for _ in range(n_bays)]
+    scheds: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
+    wload = [0.0] * n_bays
+    assign: dict[int, dict] = {}
+
+    def _insert(bid: int, deadline: float | None) -> None:
+        blk = blocks[bid]
+        r, p = blk["release_time"], blk["processing_time"]
+        prefs = blk["bay_preferences"]
+        s_max = max(prefs)
+        best = None
+        if deadline is not None:
+            for j in fit[bid]:
+                res = _earliest_coexist(bays[j], placed[j], scheds[j], blocks, geom,
+                                        bid, r, p, max_entries, max_pos, deadline)
+                if res is None:
+                    continue
+                oi, x, y, entry, exit_t = res
+                key = (exit_t, s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                if best is None or key < best[0]:
+                    best = (key, j, oi, x, y, entry, exit_t)
+        if best is None:
+            for j, (oi, x, y) in fit[bid].items():
+                entry = _empty_window(scheds[j], r, p)
+                exit_t = entry + p
+                key = (exit_t, s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                if best is None or key < best[0]:
+                    best = (key, j, oi, x, y, entry, exit_t)
+            if best is None:  # degenerate
+                entry = _empty_window(scheds[0], r, p)
+                best = ((0,), 0, 0, 0, 0, entry, entry + p)
+        _, j, oi, x, y, entry, exit_t = best
+        placed[j].append(Block(block_id=bid, block_data=blk, x=x, y=y, orient_idx=oi))
+        scheds[j].append((entry, exit_t))
+        wload[j] += u[j] * blk["workload"]
+        assign[bid] = {"block_id": bid, "bay_id": j, "x": int(x), "y": int(y),
+                       "orient_idx": oi, "entry_time": int(entry), "exit_time": int(exit_t)}
+
+    def _readd(a: dict) -> None:
+        """Restore a saved placement verbatim (used on revert)."""
+        bid, j = a["block_id"], a["bay_id"]
+        placed[j].append(Block(block_id=bid, block_data=blocks[bid],
+                               x=a["x"], y=a["y"], orient_idx=a["orient_idx"]))
+        scheds[j].append((a["entry_time"], a["exit_time"]))
+        wload[j] += u[j] * blocks[bid]["workload"]
+        assign[bid] = a
+
+    def _remove(bid: int) -> None:
+        a = assign.pop(bid)
+        j = a["bay_id"]
+        idx = next(i for i, b in enumerate(placed[j]) if b.block_id == bid)
+        placed[j].pop(idx)
+        scheds[j].pop(idx)
+        wload[j] -= u[j] * blocks[bid]["workload"]
+
+    # -- Initial construction (jittered-EDD, pace deadline) --------------------
+    if seed == 0:
+        order = sorted(range(len(blocks)),
+                       key=lambda i: (blocks[i]["due_date"], blocks[i]["processing_time"]))
+    else:
+        dues = sorted(b["due_date"] for b in blocks)
+        span = (dues[-1] - dues[0]) or 1
+        jit = max(1.0, span / max(1, len(dues)))
+        order = sorted(range(len(blocks)),
+                       key=lambda i: (blocks[i]["due_date"] + rng.uniform(-jit, jit),
+                                      blocks[i]["processing_time"]))
+    n_total = len(order)
+    c_budget = budget * construct_frac   # construction gets a fraction; LNS the rest
+    for rank, bid in enumerate(order):
+        now = time.time()
+        dl = None if (now - t_start) > c_budget else t_start + c_budget * (rank + 1) / n_total
+        _insert(bid, dl)
+
+    best_obj = compute_objective(prob_info, list(assign.values()))[0]
+
+    # -- LNS improvement loop -------------------------------------------------
+    k = max(3, min(25, len(blocks) // 15))
+    end = t_start + budget
+    while time.time() < end:
+        # Destroy: the k/2 most tardy blocks + k/2 random (diversification).
+        tard = sorted(assign.values(),
+                      key=lambda a: blocks[a["block_id"]]["due_date"] - a["exit_time"])
+        n_t = max(1, k // 2)
+        victims = [a["block_id"] for a in tard[:n_t]]
+        pool = [b for b in assign if b not in victims]
+        if pool:
+            victims += rng.sample(pool, min(k - n_t, len(pool)))
+        saved = {bid: assign[bid] for bid in victims}
+
+        for bid in victims:
+            _remove(bid)
+        for bid in sorted(victims, key=lambda b: (blocks[b]["due_date"],
+                                                  blocks[b]["processing_time"])):
+            # Bound each re-insert so one iteration can't eat the whole budget;
+            # past the global end, fall back instantly to keep feasibility.
+            now = time.time()
+            dl = min(end, now + 0.5) if now < end else None
+            _insert(bid, dl)
+
+        obj = compute_objective(prob_info, list(assign.values()))[0]
+        if obj < best_obj - 1e-9:
+            best_obj = obj                      # accept
+        else:
+            for bid in victims:                 # revert in O(k)
+                if bid in assign:
+                    _remove(bid)
+            for bid in victims:
+                _readd(saved[bid])
+
+    return list(assign.values())
+
+
+# =============================================================================
 # Parallel multi-start (uses the 4 allowed cores; keeps the best feasible run)
 # =============================================================================
 

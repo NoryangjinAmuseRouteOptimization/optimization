@@ -28,7 +28,9 @@
 - [x] 목적함수 3요소 기여도 분석 — **obj1(tardiness) 지배적**(w1≈1.3~2.9만)
 - [x] 제출 가능한 솔버 확보 — `solver.solve_greedy` 40/40 feasible, floor 대비 4.8×
 - [x] 제출 패키지 자동화·검증 — `tools/build_submission.py` (격리 feasibility 통과)
-- [ ] **첫 제출 발송** → 리더보드 위치 확인 (쿨다운 12시간 유의) ⬅ 다음 액션
+- [x] **첫 제출 발송** ✅ 수락됨 (팀 amuse5516, 2026-06-19 14:03 UTC)
+      - 리더보드: https://optichallenge.com (결과 메일 후 확인)
+      - 다음 제출 가능: **2026-06-20 02:03 UTC** (12h 쿨다운)
 
 ### M2 — 알고리즘 개선 (예선 2~4주차, ~7/13)
 - [ ] 공간 배치 개선 (no-fit polygon / bottom-left 외 휴리스틱)

@@ -205,6 +205,53 @@ def _empty_window(scheds: list[tuple[int, int]], release: int, proc: int) -> int
     return entry
 
 
+def _partition(placed: list[Block], scheds: list[tuple[int, int]],
+               entry: int, exit_t: int):
+    """
+    Split placed blocks into the five subsets a [entry, exit_t) insertion must be
+    checked against (see _feasible_insert for the meaning of each).  These depend
+    only on the time window, not on the candidate position, so _earliest_coexist
+    computes them once per entry candidate and reuses them across all positions
+    and orientations -- avoiding an O(placed) rescan per candidate.
+    """
+    coll = []; ent_pres = []; A_ent = []; ex_pres = []; A_ex = []
+    for A, (eA, xA) in zip(placed, scheds):
+        if entry < xA and eA < exit_t:
+            coll.append(A)
+        if eA <= entry < xA:
+            ent_pres.append(A)
+        if entry <= eA < exit_t:
+            A_ent.append(A)
+        if eA < exit_t <= xA:
+            ex_pres.append(A)
+        if entry < xA <= exit_t:
+            A_ex.append(A)
+    return coll, ent_pres, A_ent, ex_pres, A_ex
+
+
+def _feasible_pre(bay: Bay, nb: Block, parts) -> bool:
+    """Precise crane/collision feasibility of nb against precomputed _partition
+    subsets.  Identical decision to _feasible_insert, with the time filtering
+    already done."""
+    coll, ent_pres, A_ent, ex_pres, A_ex = parts
+    for A in coll:
+        if check_collisions(bay, [nb, A]):
+            return False
+    for A in ent_pres:                       # A present at nb entry -> nb descends through A
+        if check_entry(bay, [A], nb, fast=True):
+            return False
+    for A in A_ent:                          # nb present at A entry -> A descends through nb
+        if check_entry(bay, [nb], A, fast=True):
+            return False
+    for A in ex_pres:                        # A present at nb exit  -> nb ascends through A
+        if check_exit(bay, [A], nb, fast=True):
+            return False
+    for A in A_ex:                           # nb present at A exit   -> A ascends through nb
+        if check_exit(bay, [nb], A, fast=True):
+            return False
+    return True
+
+
 def _feasible_insert(bay: Bay,
                      placed: list[Block], scheds: list[tuple[int, int]],
                      nb: Block, entry: int, exit_t: int) -> bool:
@@ -231,23 +278,7 @@ def _feasible_insert(bay: Bay,
     """
     if not bay.contains_block(nb):
         return False
-    for A, (eA, xA) in zip(placed, scheds):
-        # Stage-4 collision while intervals overlap (open).
-        if entry < xA and eA < exit_t and check_collisions(bay, [nb, A]):
-            return False
-        # Crane descent: A present at nb's entry (eA <= entry < xA).
-        if eA <= entry < xA and check_entry(bay, [A], nb, fast=True):
-            return False
-        # Crane descent: nb present at A's entry (entry <= eA < exit_t).
-        if entry <= eA < exit_t and check_entry(bay, [nb], A, fast=True):
-            return False
-        # Crane ascent: A present at nb's exit (eA < exit_t <= xA).
-        if eA < exit_t <= xA and check_exit(bay, [A], nb, fast=True):
-            return False
-        # Crane ascent: nb present at A's exit (entry < xA <= exit_t).
-        if entry < xA <= exit_t and check_exit(bay, [nb], A, fast=True):
-            return False
-    return True
+    return _feasible_pre(bay, nb, _partition(placed, scheds, entry, exit_t))
 
 
 def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int]],
@@ -274,16 +305,16 @@ def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int
                      key=lambda oi: (lambda g: g.width * g.height)(geom.geom(bid, oi)))
     for entry in cand_entries:
         exit_t = entry + proc
+        parts = _partition(placed, scheds, entry, exit_t)   # once per entry, reused
+        relevant = parts[0]                                 # collision set = time-overlap
         for oi in orients:
             g = geom.geom(bid, oi)
             if not placement.fits_in_bay(bay, g):
                 continue
-            relevant = [pb for pb, (s, e) in zip(placed, scheds)
-                        if placement._time_overlaps(entry, exit_t, s, e)]
             for (x, y) in placement.candidate_positions(bay, relevant, g, max_pos):
                 nb = Block(block_id=bid, block_data=blocks_data[bid],
                            x=x, y=y, orient_idx=oi)
-                if _feasible_insert(bay, placed, scheds, nb, entry, exit_t):
+                if bay.contains_block(nb) and _feasible_pre(bay, nb, parts):
                     return oi, x, y, entry, exit_t
             if deadline is not None and time.time() > deadline:
                 return None

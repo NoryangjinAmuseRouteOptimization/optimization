@@ -50,7 +50,7 @@ for _p in (_HERE, _HERE / "baseline"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from utils import Bay, Block, check_entry, check_exit, check_collisions  # noqa: E402
+from utils import Bay, Block, check_entry, check_exit, check_collisions, _bb_overlap  # noqa: E402
 import placement                                                          # noqa: E402
 
 
@@ -299,6 +299,13 @@ def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int
     starve the remaining blocks of time.  Bailing at the deadline lets every
     block get a fair coexistence attempt; the first feasible placement (the
     common, cheap case) is almost always found well before it.
+
+    AABB fast-path: every block _feasible_pre inspects lies in the open
+    time-overlap set `coll` (the four crane-boundary subsets are all subsets of
+    it for valid intervals).  So if a candidate's bounding box overlaps NO block
+    in `coll`, it cannot collide with or obstruct any of them -- it is feasible
+    immediately, with no Block construction and no Shapely work.  Only candidates
+    whose bbox does overlap fall through to the precise _feasible_pre check.
     """
     cand_entries = sorted({release} | {e for _, e in scheds if e > release})[:max_entries]
     orients = sorted(range(geom.n_orient(bid)),
@@ -306,12 +313,19 @@ def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int
     for entry in cand_entries:
         exit_t = entry + proc
         parts = _partition(placed, scheds, entry, exit_t)   # once per entry, reused
-        relevant = parts[0]                                 # collision set = time-overlap
+        coll = parts[0]                                      # collision set = time-overlap
+        coll_bboxes = [b.bounding_rect() for b in coll]
         for oi in orients:
             g = geom.geom(bid, oi)
             if not placement.fits_in_bay(bay, g):
                 continue
-            for (x, y) in placement.candidate_positions(bay, relevant, g, max_pos):
+            lx0, ly0, lx1, ly1 = g.bbox
+            for (x, y) in placement.candidate_positions(bay, coll, g, max_pos):
+                # candidate_positions only returns in-bay positions, so the AABB
+                # fast-path can accept without re-checking bay containment.
+                nbb = (lx0 + x, ly0 + y, lx1 + x, ly1 + y)
+                if not any(_bb_overlap(nbb, cb) for cb in coll_bboxes):
+                    return oi, x, y, entry, exit_t
                 nb = Block(block_id=bid, block_data=blocks_data[bid],
                            x=x, y=y, orient_idx=oi)
                 if bay.contains_block(nb) and _feasible_pre(bay, nb, parts):

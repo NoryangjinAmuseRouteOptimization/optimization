@@ -657,92 +657,90 @@ def solve_lns(prob_info: dict, timelimit: float = 60.0,
 
 
 # =============================================================================
-# obj3/obj2 polish: relocate blocks to a more-preferred bay (no objective rise)
+# Leftover-time local search: relocate high-cost blocks (no objective rise)
 # =============================================================================
 
-def _obj3_polish(prob_info: dict, assignments: list[dict], end: float,
-                 cur_obj: float, max_entries: int = 16, max_pos: int = 40) -> list[dict]:
+def _local_search(prob_info: dict, assignments: list[dict], end: float,
+                  cur_obj: float, max_entries: int = 16, max_pos: int = 40) -> list[dict]:
     """
-    Local search that relocates blocks to a more-preferred bay, accepting a move
-    only when the EXACT total objective strictly decreases.  Targets obj3 (and
-    obj2) on instances where tardiness is already low and preference penalty is
-    the bulk of the objective; strictly non-regressing by construction.
+    Hill-climbing local search run on whatever time is left after the multi-start
+    workers finish (easy/medium instances finish early; hard ones leave no slack,
+    so this is simply skipped there).
 
-    Runs until `end` (wall-clock).  Every relocation is _feasible_insert-checked
-    and rejected moves are reverted to the saved placement, so feasibility holds.
+    Repeatedly takes the block contributing most to the objective
+    (w1*tardiness + w3*preference_penalty), removes it, and re-inserts it at the
+    best feasible slot across ALL bays, accepting the move only when the EXACT
+    total objective strictly decreases.  This attacks obj1 (tardiness) and obj3
+    (preference) together.  Every insertion is _feasible_pre-checked and rejected
+    moves revert to the saved placement, so the solution stays feasible and the
+    objective never rises (strictly non-regressing vs the multi-start result).
     """
     blocks = prob_info["blocks"]
     bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
     n_bays = len(bays)
-    if n_bays < 2:
-        return assignments
     geom = placement.GeometryCache(prob_info)
-    areas = [b.width * b.height for b in bays]
-    u = [(sum(areas) / n_bays) / a for a in areas]
     fit: dict[int, dict[int, tuple]] = {}
     for bid in range(len(blocks)):
         fit[bid] = {j: r for j in range(n_bays)
                     if (r := _fitting_orientation(bays[j], geom, bid)) is not None}
 
+    w = prob_info.get("weights", {})
+    w1, w3 = w.get("w1", 1.0), w.get("w3", 1.0)
+
     placed: list[list[Block]] = [[] for _ in range(n_bays)]
     scheds: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
     assign: dict[int, dict] = {}
-    for a in assignments:
-        j = a["bay_id"]
-        placed[j].append(Block(block_id=a["block_id"], block_data=blocks[a["block_id"]],
+
+    def _add(a):
+        bid, j = a["block_id"], a["bay_id"]
+        placed[j].append(Block(block_id=bid, block_data=blocks[bid],
                                x=a["x"], y=a["y"], orient_idx=a["orient_idx"]))
-        scheds[j].append((a["entry_time"], a["exit_time"]))
-        assign[a["block_id"]] = a
+        scheds[j].append((a["entry_time"], a["exit_time"])); assign[bid] = a
 
     def _remove(bid):
         a = assign.pop(bid); j = a["bay_id"]
         idx = next(i for i, b in enumerate(placed[j]) if b.block_id == bid)
         placed[j].pop(idx); scheds[j].pop(idx)
 
-    def _readd(a):
-        bid, j = a["block_id"], a["bay_id"]
-        placed[j].append(Block(block_id=bid, block_data=blocks[bid],
-                               x=a["x"], y=a["y"], orient_idx=a["orient_idx"]))
-        scheds[j].append((a["entry_time"], a["exit_time"])); assign[bid] = a
+    for a in assignments:
+        _add(a)
 
-    # Blocks not already in their most-preferred bay, worst preference gap first.
-    cands = sorted(
-        (bid for bid in assign
-         if assign[bid]["bay_id"] != max(fit[bid], key=lambda j: blocks[bid]["bay_preferences"][j],
-                                         default=assign[bid]["bay_id"])),
-        key=lambda bid: blocks[bid]["bay_preferences"][assign[bid]["bay_id"]],
-    )
-    for bid in cands:
-        if time.time() >= end:
-            break
-        blk = blocks[bid]
-        r, p = blk["release_time"], blk["processing_time"]
-        prefs = blk["bay_preferences"]
-        cur_bay = assign[bid]["bay_id"]
-        saved = assign[bid]
-        # More-preferred bays than the current one, best preference first.
-        targets = sorted((j for j in fit[bid] if prefs[j] > prefs[cur_bay]),
-                         key=lambda j: prefs[j], reverse=True)
-        if not targets:
-            continue
-        _remove(bid)
-        moved = False
-        for jt in targets:
-            res = _earliest_coexist(bays[jt], placed[jt], scheds[jt], blocks, geom,
-                                    bid, r, p, max_entries, max_pos, end)
-            if res is None:
-                continue
-            oi, x, y, entry, exit_t = res
-            placed[jt].append(Block(block_id=bid, block_data=blk, x=x, y=y, orient_idx=oi))
-            scheds[jt].append((entry, exit_t))
-            assign[bid] = {"block_id": bid, "bay_id": jt, "x": int(x), "y": int(y),
-                           "orient_idx": oi, "entry_time": int(entry), "exit_time": int(exit_t)}
-            new_obj = compute_objective(prob_info, list(assign.values()))[0]
-            if new_obj < cur_obj - 1e-9:
-                cur_obj = new_obj; moved = True; break
-            _remove(bid)   # not better -> undo this target
-        if not moved:
-            _readd(saved)
+    def _contrib(bid):
+        a = assign[bid]; blk = blocks[bid]
+        tard = max(0, a["exit_time"] - blk["due_date"])
+        pen = max(blk["bay_preferences"]) - blk["bay_preferences"][a["bay_id"]]
+        return w1 * tard + w3 * pen
+
+    improved = True
+    while improved and time.time() < end:
+        improved = False
+        for bid in sorted(assign, key=_contrib, reverse=True):
+            if time.time() >= end:
+                break
+            if _contrib(bid) <= 0:
+                break                      # remaining blocks contribute nothing
+            saved = assign[bid]
+            blk = blocks[bid]
+            r, p = blk["release_time"], blk["processing_time"]
+            _remove(bid)
+            best = None                    # (obj, assignment dict)
+            for jt in fit[bid]:
+                res = _earliest_coexist(bays[jt], placed[jt], scheds[jt], blocks, geom,
+                                        bid, r, p, max_entries, max_pos, end)
+                if res is None:
+                    continue
+                oi, x, y, entry, exit_t = res
+                cand = {"block_id": bid, "bay_id": jt, "x": int(x), "y": int(y),
+                        "orient_idx": oi, "entry_time": int(entry), "exit_time": int(exit_t)}
+                _add(cand)
+                o = compute_objective(prob_info, list(assign.values()))[0]
+                _remove(bid)
+                if best is None or o < best[0]:
+                    best = (o, cand)
+            if best is not None and best[0] < cur_obj - 1e-9:
+                _add(best[1]); cur_obj = best[0]; improved = True
+            else:
+                _add(saved)
     return list(assign.values())
 
 
@@ -796,7 +794,7 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
             # instances leave no slack, so the polish is simply skipped there.
             end = t0 + timelimit - margin
             if time.time() < end - 0.5:
-                best_a = _obj3_polish(prob_info, best_a, end, best_obj)
+                best_a = _local_search(prob_info, best_a, end, best_obj)
             return {"operations": _build_operations(best_a)}
     except Exception:
         pass  # fall through to the safe sequential path below

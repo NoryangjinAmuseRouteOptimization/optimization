@@ -234,4 +234,10 @@ AABB 적용 후 재측정: **≥200블록 tardiness-heavy** 인스턴스는 LNS 
 - → **보류(되돌림).** 올바른 신호는 "대형 AND tardiness-지배"이며, 빠른 obj1 프로브
   (소예산 구성 후 obj1>0 확인)로 구별해야 함. 향후 과제.
 
-현재 제출 권장본: **uniform multistart(4 full) + local search + AABB**(무퇴보).
+또한 항상-혼합(2 full + 2 LNS + local search)도 시도: 집계는 −1.8%였으나 full 워커를
+4→2로 줄여 **17개 인스턴스가 per-instance 회귀**(prob_1 +31%, prob_35 +27% 등).
+세 가지 LNS 통합(frac-mix / 크기게이트 / 항상-혼합)이 모두 같은 이유로 실패:
+**4코어로는 full-multistart seed 다양성과 LNS를 동시 확보 불가.**
+
+현재 제출 권장본: **uniform multistart(4 full) + local search + AABB**(무퇴보, 1.953e9).
+LNS 회수는 코어>4 또는 tardiness-정밀 프로브가 가능해질 때의 과제로 남김.

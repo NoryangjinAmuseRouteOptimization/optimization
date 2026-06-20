@@ -763,9 +763,17 @@ def _local_search(prob_info: dict, assignments: list[dict], end: float,
 # =============================================================================
 
 def _worker(args):
-    """Child-process entry: build one seeded greedy solution, score it."""
+    """Child-process entry: build one seeded greedy solution, score it.
+
+    Uses a wider candidate search (max_entries, max_pos) than the defaults: with
+    the AABB fast-path each candidate is cheap, and more candidates reliably
+    tighten placement on large tardiness-heavy instances (more coexistence, less
+    tardiness) while leaving small instances unchanged (noise-level).  Applied
+    to every worker, so full multi-start seed diversity is preserved.
+    """
     prob_info, budget, seed, key_mode = args
-    a = _greedy_assignments(prob_info, budget, seed=seed, key_mode=key_mode)
+    a = _greedy_assignments(prob_info, budget, seed=seed, key_mode=key_mode,
+                            max_entries=32, max_pos=80)
     obj, _, _, _ = compute_objective(prob_info, a)
     return obj, a
 

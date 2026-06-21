@@ -678,6 +678,81 @@ def solve_lns(prob_info: dict, timelimit: float = 60.0,
 
 
 # =============================================================================
+# Perturbation for iterated local search (random multi-block destroy-recreate)
+# =============================================================================
+
+def _perturb(prob_info: dict, assignments: list[dict], rng,
+             k: int | None = None, max_entries: int = 16, max_pos: int = 40) -> list[dict]:
+    """
+    Return a feasible neighbour of `assignments`: remove k random blocks and
+    re-insert them (EDD order) at their earliest feasible slot across all bays.
+    The randomness in WHICH blocks are removed kicks the solution out of the
+    current local optimum so the following local search can find a different one.
+    Feasible by construction (_earliest_coexist / empty-bay fallback).
+    """
+    blocks = prob_info["blocks"]
+    bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
+    n_bays = len(bays)
+    geom = placement.GeometryCache(prob_info)
+    areas = [b.width * b.height for b in bays]
+    u = [(sum(areas) / n_bays) / a for a in areas]
+    fit: dict[int, dict[int, tuple]] = {}
+    for bid in range(len(blocks)):
+        fit[bid] = {j: r for j in range(n_bays)
+                    if (r := _fitting_orientation(bays[j], geom, bid)) is not None}
+
+    placed: list[list[Block]] = [[] for _ in range(n_bays)]
+    scheds: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
+    assign: dict[int, dict] = {}
+    for a in assignments:
+        j = a["bay_id"]
+        placed[j].append(Block(block_id=a["block_id"], block_data=blocks[a["block_id"]],
+                               x=a["x"], y=a["y"], orient_idx=a["orient_idx"]))
+        scheds[j].append((a["entry_time"], a["exit_time"]))
+        assign[a["block_id"]] = a
+
+    n = len(assign)
+    if k is None:
+        k = max(2, min(20, n // 12))
+    victims = rng.sample(list(assign), min(k, n))
+    for bid in victims:
+        a = assign.pop(bid); j = a["bay_id"]
+        idx = next(i for i, b in enumerate(placed[j]) if b.block_id == bid)
+        placed[j].pop(idx); scheds[j].pop(idx)
+
+    for bid in sorted(victims, key=lambda b: (blocks[b]["due_date"],
+                                              blocks[b]["processing_time"])):
+        blk = blocks[bid]
+        r, p = blk["release_time"], blk["processing_time"]
+        prefs = blk["bay_preferences"]; s_max = max(prefs)
+        best = None
+        for j in fit[bid]:
+            res = _earliest_coexist(bays[j], placed[j], scheds[j], blocks, geom,
+                                    bid, r, p, max_entries, max_pos)
+            if res is None:
+                continue
+            oi, x, y, entry, exit_t = res
+            key = (max(0, exit_t - blk["due_date"]), s_max - prefs[j], exit_t)
+            if best is None or key < best[0]:
+                best = (key, j, oi, x, y, entry, exit_t)
+        if best is None:                       # empty-bay fallback (always feasible)
+            for j, (oi, x, y) in fit[bid].items():
+                entry = _empty_window(scheds[j], r, p); exit_t = entry + p
+                key = (max(0, exit_t - blk["due_date"]), s_max - prefs[j], exit_t)
+                if best is None or key < best[0]:
+                    best = (key, j, oi, x, y, entry, exit_t)
+            if best is None:
+                j = 0; entry = _empty_window(scheds[0], r, p)
+                best = ((0,), 0, 0, 0, 0, entry, entry + p)
+        _, j, oi, x, y, entry, exit_t = best
+        placed[j].append(Block(block_id=bid, block_data=blk, x=x, y=y, orient_idx=oi))
+        scheds[j].append((entry, exit_t))
+        assign[bid] = {"block_id": bid, "bay_id": j, "x": int(x), "y": int(y),
+                       "orient_idx": oi, "entry_time": int(entry), "exit_time": int(exit_t)}
+    return list(assign.values())
+
+
+# =============================================================================
 # Leftover-time local search: relocate high-cost blocks (no objective rise)
 # =============================================================================
 
@@ -849,11 +924,26 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
     if best_a is None:
         return solve_sequential(prob_info)   # last resort, instant & feasible
 
-    # -- Local search on any remaining time (single-threaded, non-regressing) --
+    # -- Iterated local search on the remaining time (non-regressing) ----------
+    # Descend to a local optimum, then repeatedly perturb (random multi-block
+    # destroy-recreate) and re-descend, keeping the best.  This exploits long time
+    # limits: a plain local search converges and then wastes the rest, whereas ILS
+    # keeps escaping local optima.  Always restarts perturbation from the best
+    # solution and only adopts strictly-better results, so it never regresses.
     if time.time() < end - 0.5:
         try:
+            import random
+            rng = random.Random(20260621)
             best_a = _local_search(prob_info, best_a, end,
                                    compute_objective(prob_info, best_a)[0])
+            best_obj = compute_objective(prob_info, best_a)[0]
+            while time.time() < end - 0.5:
+                cand = _perturb(prob_info, best_a, rng)
+                cand = _local_search(prob_info, cand, end,
+                                     compute_objective(prob_info, cand)[0])
+                o = compute_objective(prob_info, cand)[0]
+                if o < best_obj - 1e-9:
+                    best_obj, best_a = o, cand
         except Exception:
             pass
 

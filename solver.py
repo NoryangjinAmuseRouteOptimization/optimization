@@ -822,15 +822,29 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
             best_a = None  # sandbox blocked multiprocessing -> single-threaded
 
     # -- Strong single-threaded path (ALWAYS runs on the server) ---------------
-    # This is the workhorse: a wide-candidate greedy construction.  It runs when
-    # multiprocessing is unavailable (the likely server case) or the limit is
-    # small, and is the fallback whenever the bonus path produced nothing.
-    if best_a is None and time.time() < end:
-        try:
-            best_a = _greedy_assignments(prob_info, budget, seed=0,
-                                         max_entries=32, max_pos=80)
-        except Exception:
-            best_a = None
+    # Sequential multi-start (no multiprocessing needed): try several seeds and
+    # both bay-selection keys, keep the best.  Construction returns as soon as all
+    # blocks are placed, so small/medium instances fit many attempts while large
+    # ones fit one; ~30% of the budget is reserved for the local search below.
+    # This is the workhorse on the server (where multiprocessing is blocked) and
+    # the fallback whenever the bonus path produced nothing.
+    if best_a is None:
+        construct_end = t0 + budget * 0.70
+        best_obj = float("inf")
+        specs = [(0, "exit"), (0, "tard"), (1, "exit"), (2, "exit"),
+                 (1, "tard"), (3, "exit"), (2, "tard"), (4, "exit")]
+        for seed, km in specs:
+            rem = construct_end - time.time()
+            if rem < 0.5:
+                break
+            try:
+                a = _greedy_assignments(prob_info, rem / 0.9, seed=seed,
+                                        key_mode=km, max_entries=32, max_pos=80)
+            except Exception:
+                continue
+            o = compute_objective(prob_info, a)[0]
+            if o < best_obj:
+                best_obj, best_a = o, a
 
     if best_a is None:
         return solve_sequential(prob_info)   # last resort, instant & feasible

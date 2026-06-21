@@ -50,7 +50,8 @@ for _p in (_HERE, _HERE / "baseline"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from utils import Bay, Block, check_entry, check_exit, check_collisions, _bb_overlap  # noqa: E402
+from utils import (Bay, Block, check_entry, check_exit, check_collisions,  # noqa: E402
+                   check_feasibility, _bb_overlap)
 import placement                                                          # noqa: E402
 
 
@@ -321,15 +322,21 @@ def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int
                 continue
             lx0, ly0, lx1, ly1 = g.bbox
             for (x, y) in placement.candidate_positions(bay, coll, g, max_pos):
-                # candidate_positions only returns in-bay positions, so the AABB
-                # fast-path can accept without re-checking bay containment.
+                # AABB fast-path: a candidate whose bbox lies fully inside the bay
+                # AND overlaps no time-relevant block is feasible without Shapely.
+                # The bay-containment test here is EXACT (matches the evaluator's
+                # bay.contains_block); candidate_positions uses a 1e-6 tolerance,
+                # so a boundary candidate could otherwise be wrongly accepted and
+                # fail the server's strict containment check (-> infeasible).
                 nbb = (lx0 + x, ly0 + y, lx1 + x, ly1 + y)
-                if not any(_bb_overlap(nbb, cb) for cb in coll_bboxes):
-                    return oi, x, y, entry, exit_t
-                nb = Block(block_id=bid, block_data=blocks_data[bid],
-                           x=x, y=y, orient_idx=oi)
-                if bay.contains_block(nb) and _feasible_pre(bay, nb, parts):
-                    return oi, x, y, entry, exit_t
+                if (nbb[0] >= 0 and nbb[1] >= 0
+                        and nbb[2] <= bay.width and nbb[3] <= bay.height):
+                    if not any(_bb_overlap(nbb, cb) for cb in coll_bboxes):
+                        return oi, x, y, entry, exit_t
+                    nb = Block(block_id=bid, block_data=blocks_data[bid],
+                               x=x, y=y, orient_idx=oi)
+                    if _feasible_pre(bay, nb, parts):
+                        return oi, x, y, entry, exit_t
             if deadline is not None and time.time() > deadline:
                 return None
     return None
@@ -791,41 +798,67 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
     below it; extra seeds only add chances to improve.
     """
     t0 = time.time()
+    margin = max(1.5, timelimit * 0.04)
+    budget = timelimit - margin
+    end = t0 + timelimit - margin
+    best_a = None
+
+    # -- Optional bonus: parallel multi-start (only if the sandbox allows it) ---
+    # On the evaluation server multiprocessing may be unavailable/blocked; we must
+    # NOT depend on it.  Treat it as a best-effort booster: if it works, keep the
+    # best worker; if it raises or yields nothing, fall through to the strong
+    # single-threaded path below.
+    if timelimit >= 8.0:
+        try:
+            import os
+            from concurrent.futures import ProcessPoolExecutor
+            n_workers = min(workers, os.cpu_count() or 1)
+            if n_workers >= 2:
+                tasks = [(prob_info, budget, s, "exit") for s in range(n_workers)]
+                with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                    results = list(ex.map(_worker, tasks))
+                best_a = min(results, key=lambda r: r[0])[1]
+        except Exception:
+            best_a = None  # sandbox blocked multiprocessing -> single-threaded
+
+    # -- Strong single-threaded path (ALWAYS runs on the server) ---------------
+    # This is the workhorse: a wide-candidate greedy construction.  It runs when
+    # multiprocessing is unavailable (the likely server case) or the limit is
+    # small, and is the fallback whenever the bonus path produced nothing.
+    if best_a is None and time.time() < end:
+        try:
+            best_a = _greedy_assignments(prob_info, budget, seed=0,
+                                         max_entries=32, max_pos=80)
+        except Exception:
+            best_a = None
+
+    if best_a is None:
+        return solve_sequential(prob_info)   # last resort, instant & feasible
+
+    # -- Local search on any remaining time (single-threaded, non-regressing) --
+    if time.time() < end - 0.5:
+        try:
+            best_a = _local_search(prob_info, best_a, end,
+                                   compute_objective(prob_info, best_a)[0])
+        except Exception:
+            pass
+
+    return _ensure_feasible(prob_info, {"operations": _build_operations(best_a)})
+
+
+def _ensure_feasible(prob_info: dict, sol: dict) -> dict:
+    """
+    Final safety net: verify the produced solution with the SAME checker the
+    evaluation server uses (utils.check_feasibility).  If it is feasible, return
+    it; otherwise fall back to the always-feasible sequential schedule.  This
+    makes an infeasible submission (a -1 on the server) impossible regardless of
+    any bug in the optimizing path -- exactly the failure that broke P3.
+    """
     try:
-        import os
-        from concurrent.futures import ProcessPoolExecutor
-
-        n_workers = min(workers, os.cpu_count() or 1)
-        # For tiny limits the process-pool overhead is not worth it.
-        if timelimit >= 8.0 and n_workers >= 2:
-            margin = max(1.5, timelimit * 0.04)   # spawn + gather + build ops
-            budget = timelimit - margin
-            # Half the workers minimize earliest-finish ("exit", best for
-            # tardiness-dominated instances), half minimize tardiness-then-
-            # preference ("tard", best where tardiness is ~0 and obj3 rules).
-            # Best of all is kept, so each instance gets its better regime.
-            # All workers use the "exit" key (full seed diversity for the
-            # tardiness-dominated instances that drive the score).
-            tasks = [(prob_info, budget, s, "exit") for s in range(n_workers)]
-            with ProcessPoolExecutor(max_workers=n_workers) as ex:
-                results = list(ex.map(_worker, tasks))   # each self-limits < budget
-            best_obj, best_a = min(results, key=lambda r: r[0])
-            # Workers on easy instances finish well before the budget; spend any
-            # leftover time polishing obj3/obj2 (relocate blocks to a more
-            # preferred bay only when the total objective strictly drops).  Hard
-            # instances leave no slack, so the polish is simply skipped there.
-            end = t0 + timelimit - margin
-            if time.time() < end - 0.5:
-                best_a = _local_search(prob_info, best_a, end, best_obj)
-            return {"operations": _build_operations(best_a)}
+        if check_feasibility(prob_info, sol)["feasible"]:
+            return sol
     except Exception:
-        pass  # fall through to the safe sequential path below
-
-    # Fallback: single greedy pass with the remaining time (still feasible).
-    remaining = timelimit - (time.time() - t0)
-    if remaining > 1.0:
-        return solve_greedy(prob_info, remaining)
-    # Last resort: instant, always-feasible sequential schedule.
+        pass
     return solve_sequential(prob_info)
 
 

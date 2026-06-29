@@ -4,7 +4,7 @@ build_submission.py -- assemble and validate the competition submission zip
 
 Produces dist/submission.zip with the layout the evaluation server expects:
 
-    myalgorithm.py     (root)  -- entry point; calls solver.solve_greedy
+    myalgorithm.py     (root)  -- entry point; calls solver.solve (safety net)
     solver.py          (root)  -- our solver
     placement.py       (root)  -- spatial/geometry module
     utils.py           (root)  -- OFFICIAL, unmodified (server overwrites it)
@@ -38,12 +38,22 @@ DIST = ROOT / "dist"
 
 # Generated entry point.  Kept tiny and dependency-light; the real work is in
 # solver.py.  Lives only inside the zip, so it never shadows the repo's tooling.
+#
+# IMPORTANT: this delegates to solver.solve (NOT solver.solve_greedy).  solve()
+# is the only path that ends in solver._ensure_feasible(), the safety net that
+# re-checks the result with utils.check_feasibility and falls back to the
+# always-feasible sequential schedule if anything is wrong.  Calling
+# solve_greedy here would bypass that net and let an infeasible solution reach
+# the server -- exactly the P3 -1 failure we are guarding against.
 MYALGORITHM_SRC = '''\
 # OGC2026 submission entry point.
-# The server calls algorithm(prob_info, timelimit); we delegate to solver.
+# The server calls algorithm(prob_info, timelimit); we delegate to solver.solve,
+# whose final _ensure_feasible() step guarantees a feasible result (it falls back
+# to the sequential schedule if the optimizing path ever produces an infeasible
+# solution).  Do NOT change this to solve_greedy: that bypasses the safety net.
 def algorithm(prob_info, timelimit=60):
     import solver
-    return solver.solve_greedy(prob_info, timelimit)
+    return solver.solve(prob_info, timelimit)
 '''
 
 # Files copied verbatim from the repo into the zip root.
@@ -92,6 +102,23 @@ def validate(zip_path: pathlib.Path, instance: pathlib.Path, timelimit: float):
     assert "myalgorithm.py" in names, "myalgorithm.py missing from zip root"
     assert all("/" not in n for n in names), "files must be at zip root"
     assert size_mb <= 15.0, f"zip exceeds 15 MB ({size_mb:.2f})"
+
+    # Report SHA256 of each packaged file.  Hashes are how we verify the right
+    # build went out -- byte counts drift with every edit and are unsafe to pin
+    # in docs, so we identify the build by content hash instead.
+    with zipfile.ZipFile(zip_path) as z:
+        for n in sorted(names):
+            digest = hashlib.sha256(z.read(n)).hexdigest()
+            print(f"sha256    : {n:16s} {digest}")
+
+    # The packaged entry point MUST delegate to solver.solve (the safety-net
+    # path), never solver.solve_greedy (which bypasses _ensure_feasible).
+    with zipfile.ZipFile(zip_path) as z:
+        entry_src = z.read("myalgorithm.py").decode()
+    assert "solver.solve(" in entry_src, \
+        "myalgorithm.py must call solver.solve (the _ensure_feasible safety net)"
+    assert "solver.solve_greedy(" not in entry_src, \
+        "myalgorithm.py must NOT call solver.solve_greedy -- it bypasses the safety net"
 
     # 2. Functional check in an ISOLATED dir (only the unzipped files on path),
     #    run as a child process so nothing from the repo leaks in.

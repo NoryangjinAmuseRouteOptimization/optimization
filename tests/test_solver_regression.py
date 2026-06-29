@@ -18,6 +18,19 @@ server execution model:
   3. test_single_threaded_feasible  -- with multiprocessing DISABLED (the server
      scenario), solve() must return feasible solutions within the time limit.
 
+  4. test_submission_entry_point  -- the ACTUAL packaged entry point matters, not
+     just solver.solve().  The server runs zip-root myalgorithm.py, so this pins
+     that the generated entry point delegates to solver.solve (the path that ends
+     in the _ensure_feasible safety net) and NOT solver.solve_greedy (which
+     bypasses it).  This is the exact gap that let the P3 -1 ship: solve() had the
+     net, but the submitted myalgorithm.py called solve_greedy and skipped it.
+
+  5. test_packaged_zip_feasible  -- build the real submission.zip, extract it into
+     an isolated dir, and run the packaged myalgorithm.algorithm(...) as a child
+     process with ONLY that dir on the path (mirroring the server).  Its result
+     must pass utils.check_feasibility.  This exercises the end-to-end submission
+     path, not just an in-repo import.
+
 Run:
     cd <repo root>
     python tests/test_solver_regression.py
@@ -25,16 +38,21 @@ Run:
 
 import json
 import pathlib
+import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "baseline"))   # utils
 sys.path.insert(0, str(ROOT))                 # solver, placement
+sys.path.insert(0, str(ROOT / "tools"))       # build_submission
 
 from utils import Bay, Block, check_feasibility   # noqa: E402
 import placement                                  # noqa: E402
 import solver                                     # noqa: E402
+import build_submission                           # noqa: E402
 
 
 def _rect_block(verts):
@@ -125,12 +143,80 @@ def test_single_threaded_feasible() -> bool:
     return ok
 
 
+def test_submission_entry_point() -> bool:
+    """
+    The packaged entry point must delegate to solver.solve (safety-net path), not
+    solver.solve_greedy.  Check both the source template in build_submission.py
+    and the myalgorithm.py actually written into dist/submission.zip.
+    """
+    ok = True
+
+    # (a) the source template build_submission.py uses.
+    src = build_submission.MYALGORITHM_SRC
+    if "solver.solve(" not in src or "solver.solve_greedy(" in src:
+        ok = False
+        print("  [FAIL] MYALGORITHM_SRC does not call solver.solve "
+              "(or still calls solver.solve_greedy)")
+
+    # (b) the file that ends up in the built zip.
+    zip_path = build_submission.build()
+    with zipfile.ZipFile(zip_path) as z:
+        entry = z.read("myalgorithm.py").decode()
+    if "return solver.solve(prob_info, timelimit)" not in entry:
+        ok = False
+        print("  [FAIL] packaged myalgorithm.py does not "
+              "'return solver.solve(prob_info, timelimit)'")
+    if "solver.solve_greedy(" in entry:
+        ok = False
+        print("  [FAIL] packaged myalgorithm.py still calls solver.solve_greedy")
+
+    print(f"  test_submission_entry_point: {'PASS' if ok else 'FAIL'} "
+          f"(packaged entry point calls solver.solve)")
+    return ok
+
+
+def test_packaged_zip_feasible() -> bool:
+    """
+    End-to-end: build the zip, extract into an isolated dir, and run the packaged
+    myalgorithm.algorithm(...) as a child process with only that dir on the path
+    (the server's execution model).  The result must be feasible.  This is the
+    test that would have caught the solve_greedy entry point shipping without the
+    _ensure_feasible safety net.
+    """
+    zip_path = build_submission.build()
+    inst = (ROOT / "data" / "train" / "prob_21.json").resolve()
+    ok = True
+    with tempfile.TemporaryDirectory() as td:
+        tdp = pathlib.Path(td)
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tdp)
+        runner = (
+            "import json,sys;"
+            "import myalgorithm,utils;"
+            f"p=json.load(open(r'{inst}'));"
+            "s=myalgorithm.algorithm(p,8);"
+            "r=utils.check_feasibility(p,s);"
+            "sys.exit(0 if r['feasible'] else 1)"
+        )
+        res = subprocess.run([sys.executable, "-c", runner], cwd=tdp,
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            ok = False
+            print(f"  [FAIL] packaged algorithm infeasible/crashed: "
+                  f"{(res.stdout + res.stderr).strip()}")
+    print(f"  test_packaged_zip_feasible: {'PASS' if ok else 'FAIL'} "
+          f"(isolated packaged myalgorithm.algorithm -> feasible)")
+    return ok
+
+
 if __name__ == "__main__":
     print("=== solver regression tests ===")
     results = [
         test_aabb_boundary(),
         test_safety_net(),
         test_single_threaded_feasible(),
+        test_submission_entry_point(),
+        test_packaged_zip_feasible(),
     ]
     print(f"\nRESULT: {sum(results)}/{len(results)} passed")
     sys.exit(0 if all(results) else 1)

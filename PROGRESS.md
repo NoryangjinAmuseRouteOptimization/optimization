@@ -4,6 +4,14 @@
 > 상세 실험 기록: `docs/p3_solver_baseline.md`, `docs/p1_packing_benchmark.md`
 > 제출 이력: `docs/submissions_log.md`
 
+> ## 🔴 다음 액션 (NEXT)
+> **fixed AABB version 재제출** → **P1~P6 서버 점수 확보**.
+> - 제출 zip의 `solver.py`는 반드시 **40,444 bytes** (옛 버그본 37,169 bytes 금지).
+>   빌드: `python tools/build_submission.py`
+> - 재제출 후 P3 feasible 복구 + 5개 objective 개선 여부 확인 → `docs/submissions_log.md`
+>   #4 표에 기록.
+> - 그 데이터 확보 전까지 새 알고리즘 추가 금지(블라인드 튜닝은 측정으로 소진됨).
+
 ## 1. 한 줄 요약
 "제출 불가 baseline"에서 시작해 **항상 feasible·시간안전·다단계 최적화 솔버**를 구축.
 서버가 멀티프로세싱을 차단한다는 사실을 진단해 **단일스레드 경로를 주력으로 재설계**,
@@ -18,6 +26,7 @@
 | `tools/bench_packing.py` | 후보 생성기 패킹밀도 벤치마크 |
 | `tools/build_submission.py` | 제출 zip 빌드 + **격리 feasibility 검증** |
 | `tests/test_placement.py` | `can_place`가 평가서버와 일치하는지 검증 |
+| `tests/test_solver_regression.py` | P3 AABB 경계버그 회귀 + 안전망 + 단일스레드 feasible 고정 |
 
 ## 3. 솔버 발전 (훈련셋 40개 총 목적값)
 | 단계 | 총 목적값 | 비고 |
@@ -53,5 +62,13 @@
 
 ## 6. 현재 상태 / 다음
 - ✅ 수정본 준비 완료: P3 복구 + −26% + 안전망. `python tools/build_submission.py`로 빌드.
+- ✅ 회귀 테스트 고정: `tests/test_solver_regression.py` (AABB 경계버그/안전망/단일스레드).
 - ⚠️ **다음 액션: 올바른 수정본(40,444 bytes) 재제출** → 실제 P1~P6 숫자 확보.
 - ▶ 그 데이터로 약한 인스턴스 타겟 최적화 (블라인드 튜닝은 측정으로 소진됨).
+
+### 로컬 검증 명령 (제출 전 권장)
+```bash
+python tests/test_placement.py            # 기하 feasibility 일치
+python tests/test_solver_regression.py    # 회귀(AABB/안전망/단일스레드) 3/3
+python tools/build_submission.py          # dist/submission.zip 빌드 + 격리 feasibility
+```

@@ -160,7 +160,11 @@ if compute_objective(narrow_a) < _SMALL_OBJ_THRESHOLD:    # 소형/P3-like
 - 회귀 **6/6** (신규 `test_p3like_quarantine`: 소형→narrow 경로 확인 + 대형→wide, 양쪽 feasible).
 - 빌드 smoke **양 경로**: prob_5(narrow) FEASIBLE obj=147,983 / prob_21(wide) FEASIBLE.
 - 라우팅 검증(30s): 소형 4개→narrow·feasible, 대형 4개→wide·feasible.
-- 훈련 분류(narrow probe): 소형=prob_5/14/1/22 등(목적값<3.5M), 대형=prob_29/21/38/40 등(≥3.5M).
+- **훈련 40개 전수 분류**(narrow probe 17s = 서버 실제 budget): **소형 20 / 대형 20**,
+  **narrow 경로 40/40 feasible**. 임계값 3.5M은 **빈 구간**에 위치 — 최고 소형 prob_22(1.78M)와
+  최저 대형 prob_36(4.15M) 사이 ~2.3× 간극에 인스턴스 없음 → 타이밍/budget 변동으로 분류가
+  뒤집힐 위험 없음(분기가 과도하게 넓지 않음 확인). 숨김셋 대응: P1/P2/P3(43k/85k/760k) ≪ 3.5M
+  → narrow(P3 안전), P4/P5/P6(15M/35M/202M) ≫ 3.5M → wide(무변경).
 
 **기대 결과 / 리스크**
 - 기대: **P3 feasible 복구**(narrow가 #1처럼 서버-feasible). P1/P2는 narrow 손해 감수, P4/P5/P6 무변경.

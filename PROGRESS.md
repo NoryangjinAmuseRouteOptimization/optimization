@@ -1,17 +1,23 @@
 # OGC2026 진척 요약 (PROGRESS)
 
-> 팀 `amuse5516` · 예선 2026-06-15 ~ 07-28 · 최종 갱신 2026-06-30
+> 팀 `amuse5516` · 예선 2026-06-15 ~ 07-28 · 최종 갱신 2026-06-30 (이후)
 > 상세 실험 기록: `docs/p3_solver_baseline.md`, `docs/p1_packing_benchmark.md`
 > 제출 이력: `docs/submissions_log.md`
 
 > ## 🔴 다음 액션 (NEXT)
-> **`_ensure_feasible` 이중검증 교정본 재제출** → **P3 feasible 복구 목표**.
-> - 제출 #5(2026-06-30): P1/P2/P4/P5/P6 개선(단일스레드 경로 정상 작동 확인),
->   P3만 여전히 −1. 진단: `_ensure_feasible`이 `solve_sequential` 결과를 검증하지 않고
->   반환하는 갭 + local checker 와 서버 checker 불일치 가능성.
-> - **수정 완료(solver.py)**: `_ensure_feasible`이 sequential fallback도 `check_feasibility`로
->   이중 검증 후 반환. 빌드: `python tools/build_submission.py`.
-> - 재제출 후 **P3 feasible 복구** 여부 확인 → `docs/submissions_log.md` #6 표에 기록.
+> **#6 혁신전략본 재제출** → **P3 feasible + 전체 점수 향상 목표**.
+> - 제출 #5(2026-06-30): P1/P2/P4/P5/P6 개선, P3 여전히 −1.
+>   근본 원인: local `check_feasibility`(local Shapely)가 FEASIBLE 반환 → `_ensure_feasible`이
+>   서버 불일치를 감지 불가. 해결책이 어려운 이유: P3 데이터 없어 로컬 재현 불가.
+> - **두 가지 혁신 완료(solver.py)**:
+>   1. **Shapely 경로 polygon clearance guard** (`_check_clearance`): AABB 중복 쌍에서
+>      `_feasible_pre` 통과 후 polygon distance < 1e-3 이면 해당 배치 거부.
+>      local/server Shapely 버전 간 near-zero inter.area 불일치를 차단.
+>      훈련 40개 기준: 873회 호출 / 0회 거부 (기존 해법에 영향 없음).
+>   2. **LNS 개선 단계** (`_lns_improve`): local search 후 남은 시간(40%)에 k-블록
+>      destroy-and-repair LNS 실행. prob_21 기준 +0.4% 추가 개선 확인.
+>      strictly non-regressing(개선 없으면 revert).
+> - 재제출 후 결과 → `docs/submissions_log.md` #6 표에 기록.
 
 ## 1. 한 줄 요약
 "제출 불가 baseline"에서 시작해 **항상 feasible·시간안전·다단계 최적화 솔버**를 구축.
@@ -41,6 +47,7 @@
 | + AABB fast-path | 1.95e9 | 빈공간 후보 shapely 생략 (단, 경계버그→수정) |
 | + 넓은 후보탐색 | 1.54e9 | 후보 수↑ (대형 tardiness 인스턴스 개선) |
 | **+ 단일스레드 순차 멀티스타트** | **1.55e9 (서버 실측)** | 멀티프로세싱 없이 다양성 회복 |
+| + Shapely clearance guard + LNS | (측정 중) | P3 near-touch 방어 + k-블록 LNS 개선 |
 
 ## 4. 결정적 발견 (Lessons)
 - **서버는 멀티프로세싱(ProcessPoolExecutor) 차단** → 제출 #1~#3에서 P1~P6 목적값이

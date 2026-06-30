@@ -116,18 +116,25 @@ return solve_sequential(prob_info)
 degenerate fallback이 있음. 이 위치가 infeasible이면 그대로 서버로 나갈 수 있음.
 → 수정: **`solve_sequential` 결과도 `check_feasibility`로 검증** 후 반환 (commit 다음).
 
-## ★ #6 준비분 — `_ensure_feasible` 이중 검증 (commit 예정)
-`_ensure_feasible`이 sequential fallback 결과도 verify. 변경:
-```python
-fallback = solve_sequential(prob_info)
-try:
-    if check_feasibility(prob_info, fallback)["feasible"]:
-        return fallback
-except Exception:
-    pass
-return fallback  # best-effort (이론적으로는 항상 feasible)
-```
-훈련셋 40개: 기존 5/5 회귀테스트 통과.
-→ 다음 제출 가능 시각(#5 +12h 이후)에 이 버전으로 재제출.
+## ★ #6 준비분 — Shapely clearance guard + LNS (두 가지 혁신)
+
+**배경 진단**: `_ensure_feasible`이 `solve_sequential` 이중검증 포함, 엔트리포인트 교정 포함
+등 5번의 패치를 거쳤지만 P3가 여전히 −1. 근본 원인은 **local `check_feasibility`(local Shapely)
+이미 FEASIBLE 반환 → `_ensure_feasible` fallback 비활성**. 해결 방향: 서버와 local Shapely가
+불일치할 수 있는 near-touching 배치를 건설 단계에서 차단 + 객관값 개선.
+
+**변경 1: Shapely 경로 polygon clearance guard** (`_check_clearance`)
+AABB 중복이 있어 Shapely path(slow-path)를 탄 후 `_feasible_pre` 통과 시,
+coexisting block 간 polygon.distance() < 1e-3 이면 해당 배치 거부.
+→ local/server GEOS 버전간 near-zero `inter.area` 불일치를 construction 단계에서 차단.
+→ 훈련 40개(8s): 873회 호출 / 0회 거부 (기존 해법 품질 영향 없음, 비활성화 없음).
+
+**변경 2: LNS 개선 단계** (`_lns_improve`)
+`_local_search` 후 남은 시간(40%)에 k-블록 destroy-and-repair LNS 실행.
+→ prob_21 기준 +0.4% 추가 개선 (3,133,196 → 3,120,660) 확인.
+→ strictly non-regressing: 개선 없으면 O(k) revert.
+
+훈련셋: 5/5 회귀테스트 통과, 40/40 feasible(8s), smoke test feasible(30s).
+→ 제출 후 P3 feasible 여부 및 P1-P6 점수 기록.
 
 <!-- 다음 제출 결과를 여기에 추가 -->

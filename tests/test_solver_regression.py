@@ -31,6 +31,14 @@ server execution model:
      must pass utils.check_feasibility.  This exercises the end-to-end submission
      path, not just an in-repo import.
 
+  6. test_p3like_quarantine  -- the P3-like quarantine must (a) route a small
+     instance to the conservative NARROW greedy (seed 0, max_entries=16,
+     max_pos=40 -- the #1-era profile that was server-feasible on P3), returning
+     exactly that solution and not the wide/local path, and (b) route a large
+     instance (narrow objective above _SMALL_OBJ_THRESHOLD) to the wide optimizer.
+     Both must be feasible.  This pins the fix for the P3 -1 that the wide path
+     reintroduced on the server while local check_feasibility kept passing.
+
 Run:
     cd <repo root>
     python tests/test_solver_regression.py
@@ -209,6 +217,55 @@ def test_packaged_zip_feasible() -> bool:
     return ok
 
 
+def test_p3like_quarantine() -> bool:
+    """
+    Small instance -> conservative narrow greedy (the server-feasible P3 profile);
+    large instance -> wide optimizer.  Both feasible.
+    """
+    ok = True
+    L = 10.0
+
+    # (a) small instance: must take the narrow path and return exactly it.
+    prob_s = json.load(open(ROOT / "data" / "train" / "prob_5.json"))
+    narrow = solver._greedy_assignments(prob_s, L, seed=0, key_mode="exit",
+                                        max_entries=16, max_pos=40)
+    narrow_obj = solver.compute_objective(prob_s, narrow)[0]
+    if narrow_obj >= solver._SMALL_OBJ_THRESHOLD:
+        ok = False
+        print(f"  [FAIL] prob_5 narrow objective {narrow_obj:.0f} not below "
+              f"threshold {solver._SMALL_OBJ_THRESHOLD} (test instance assumption)")
+    sol_s = solver.solve(prob_s, L)
+    r_s = check_feasibility(prob_s, sol_s)
+    obj_s = r_s["objective"]
+    # The small path returns the narrow greedy verbatim, so the objective must
+    # match the narrow probe (not the much-lower wide objective) -- i.e. the wide
+    # path was NOT used.  Allow a tiny tolerance for deadline jitter.
+    if not r_s["feasible"]:
+        ok = False
+        print("  [FAIL] small instance (prob_5) infeasible")
+    elif abs(obj_s - narrow_obj) > max(1.0, 0.02 * narrow_obj):
+        ok = False
+        print(f"  [FAIL] small instance not on narrow path: solve obj {obj_s:.0f} "
+              f"!= narrow obj {narrow_obj:.0f} (wide path leaked in?)")
+
+    # (b) large instance: narrow objective above threshold -> routed to wide.
+    prob_l = json.load(open(ROOT / "data" / "train" / "prob_40.json"))
+    narrow_l = solver._greedy_assignments(prob_l, L, seed=0, key_mode="exit",
+                                          max_entries=16, max_pos=40)
+    if solver.compute_objective(prob_l, narrow_l)[0] < solver._SMALL_OBJ_THRESHOLD:
+        ok = False
+        print("  [FAIL] prob_40 narrow objective below threshold "
+              "(test instance assumption)")
+    sol_l = solver.solve(prob_l, L)
+    if not check_feasibility(prob_l, sol_l)["feasible"]:
+        ok = False
+        print("  [FAIL] large instance (prob_40) infeasible")
+
+    print(f"  test_p3like_quarantine: {'PASS' if ok else 'FAIL'} "
+          f"(small->narrow obj={obj_s:.0f}, large->wide, both feasible)")
+    return ok
+
+
 if __name__ == "__main__":
     print("=== solver regression tests ===")
     results = [
@@ -217,6 +274,7 @@ if __name__ == "__main__":
         test_single_threaded_feasible(),
         test_submission_entry_point(),
         test_packaged_zip_feasible(),
+        test_p3like_quarantine(),
     ]
     print(f"\nRESULT: {sum(results)}/{len(results)} passed")
     sys.exit(0 if all(results) else 1)

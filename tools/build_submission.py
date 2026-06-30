@@ -121,30 +121,38 @@ def validate(zip_path: pathlib.Path, instance: pathlib.Path, timelimit: float):
         "myalgorithm.py must NOT call solver.solve_greedy -- it bypasses the safety net"
 
     # 2. Functional check in an ISOLATED dir (only the unzipped files on path),
-    #    run as a child process so nothing from the repo leaks in.
-    instance = instance.resolve()
+    #    run as a child process so nothing from the repo leaks in.  We smoke-test
+    #    BOTH routing paths so a regression in either fails the build:
+    #      * a SMALL instance -> the P3-like quarantine / narrow-greedy path
+    #        (the conservative solution that keeps P3 feasible on the server),
+    #      * the given (large) instance -> the wide optimizer path.
+    #    If the safe path ever produces a locally-infeasible result we must NOT
+    #    ship it -- the build fails instead.
+    small_inst = (ROOT / "data" / "train" / "prob_5.json").resolve()
+    instances = [small_inst, instance.resolve()]
     with tempfile.TemporaryDirectory() as td:
         tdp = pathlib.Path(td)
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(tdp)
-        runner = (
-            "import json,sys;"
-            "import myalgorithm,utils;"
-            f"p=json.load(open(r'{instance}'));"
-            f"s=myalgorithm.algorithm(p,{timelimit});"
-            "r=utils.check_feasibility(p,s);"
-            "print('FEASIBLE' if r['feasible'] else 'INFEASIBLE stage='+str(r['stage']),"
-            "'obj=%.0f'%r['objective'] if r['feasible'] else '');"
-            "sys.exit(0 if r['feasible'] else 1)"
-        )
-        print(f"smoke test: {instance.name} (timelimit={timelimit}s, isolated)")
-        res = subprocess.run([sys.executable, "-c", runner], cwd=tdp,
-                             capture_output=True, text=True)
-        out = (res.stdout + res.stderr).strip()
-        print(f"result    : {out}")
-        if res.returncode != 0:
-            raise SystemExit("submission FAILED isolated feasibility check")
-    print("OK: submission self-contained and feasible.")
+        for inst in instances:
+            runner = (
+                "import json,sys;"
+                "import myalgorithm,utils;"
+                f"p=json.load(open(r'{inst}'));"
+                f"s=myalgorithm.algorithm(p,{timelimit});"
+                "r=utils.check_feasibility(p,s);"
+                "print('FEASIBLE' if r['feasible'] else 'INFEASIBLE stage='+str(r['stage']),"
+                "'obj=%.0f'%r['objective'] if r['feasible'] else '');"
+                "sys.exit(0 if r['feasible'] else 1)"
+            )
+            print(f"smoke test: {inst.name} (timelimit={timelimit}s, isolated)")
+            res = subprocess.run([sys.executable, "-c", runner], cwd=tdp,
+                                 capture_output=True, text=True)
+            out = (res.stdout + res.stderr).strip()
+            print(f"result    : {out}")
+            if res.returncode != 0:
+                raise SystemExit(f"submission FAILED isolated feasibility check on {inst.name}")
+    print("OK: submission self-contained and feasible (both routing paths).")
 
 
 def main():

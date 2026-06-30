@@ -116,25 +116,56 @@ return solve_sequential(prob_info)
 degenerate fallback이 있음. 이 위치가 infeasible이면 그대로 서버로 나갈 수 있음.
 → 수정: **`solve_sequential` 결과도 `check_feasibility`로 검증** 후 반환 (commit 다음).
 
-## ★ #6 준비분 — Shapely clearance guard + LNS (두 가지 혁신)
+## ★ #6 준비분 — P3-like 격리(quarantine): 소형은 narrow greedy로 우회
 
-**배경 진단**: `_ensure_feasible`이 `solve_sequential` 이중검증 포함, 엔트리포인트 교정 포함
-등 5번의 패치를 거쳤지만 P3가 여전히 −1. 근본 원인은 **local `check_feasibility`(local Shapely)
-이미 FEASIBLE 반환 → `_ensure_feasible` fallback 비활성**. 해결 방향: 서버와 local Shapely가
-불일치할 수 있는 near-touching 배치를 건설 단계에서 차단 + 객관값 개선.
+> 목표 변경: **P3 objective 개선이 아니라 P3 −1 제거**. P3 점수 욕심 버림.
+> P1/P2 약간의 손해는 감수(−1 제거가 절대 우선).
 
-**변경 1: Shapely 경로 polygon clearance guard** (`_check_clearance`)
-AABB 중복이 있어 Shapely path(slow-path)를 탄 후 `_feasible_pre` 통과 시,
-coexisting block 간 polygon.distance() < 1e-3 이면 해당 배치 거부.
-→ local/server GEOS 버전간 near-zero `inter.area` 불일치를 construction 단계에서 차단.
-→ 훈련 40개(8s): 873회 호출 / 0회 거부 (기존 해법 품질 영향 없음, 비활성화 없음).
+**근본 진단 (왜 5번 패치로도 P3가 안 고쳐졌나)**
+`_ensure_feasible` 이중검증·엔트리포인트 교정 등은 모두 **local `check_feasibility` 기준**.
+그런데 P3의 실패는 **wide 탐색+local search(#5부터 서버 실행)가 만든 near-touch 배치**가
+local Shapely에선 `inter.area==0`(FEASIBLE)이나 **서버 Shapely에선 `inter.area>0`(reject)**.
+즉 local 기준 안전망으로는 원천적으로 감지 불가. **P3 데이터가 없어 로컬 재현·정밀탐지도 불가.**
 
-**변경 2: LNS 개선 단계** (`_lns_improve`)
-`_local_search` 후 남은 시간(40%)에 k-블록 destroy-and-repair LNS 실행.
-→ prob_21 기준 +0.4% 추가 개선 (3,133,196 → 3,120,660) 확인.
-→ strictly non-regressing: 개선 없으면 O(k) revert.
+**핵심 통찰 (검증된 안전 프로필)**
+제출 #1~#4의 P1~P6 점수(**P3=760,267 포함**)는 전부 **narrow 공존 greedy
+(seed 0, max_entries=16, max_pos=40) fallback**의 결과 — 멀티프로세싱 차단으로 wide가 한 번도
+실행 안 됐기 때문. **그때 P3는 feasible**이었다. ⇒ narrow greedy = P3 서버-feasible 검증 경로.
 
-훈련셋: 5/5 회귀테스트 통과, 40/40 feasible(8s), smoke test feasible(30s).
-→ 제출 후 P3 feasible 여부 및 P1-P6 점수 기록.
+**왜 "위험쌍 탐지로 P3만 골라내기"가 아니라 "스케일 분리"인가**
+AABB-zero-area 공존쌍은 **모든 인스턴스에 공통**(훈련 27~106쌍/개, 전부 feasible)이라
+P3만 식별 불가. 반면 narrow greedy 목적값(=#1 점수)은 **P3(760k)와 P4(15.27M) 사이 ~20× 간극**.
+⇒ 목적값으로 **소형(P1/P2/P3) vs 대형(P4/P5/P6)** 분리는 견고. 임계값 `_SMALL_OBJ_THRESHOLD=3.5M`
+(간극 기하중앙, 양쪽 ~4.4×/4.6× 여유).
+
+**왜 sequential이 아니라 narrow greedy인가 (측정)**
+sequential 격리는 소형에서 **1000×+ 악화**(prob_1 154k→440M, prob_14 237k→850M; 소형은 블록 多·
+베이 少라 1블록/베이 강제 시 대기 tardiness 폭증). narrow greedy는 공존 유지 →
+wide 대비 **~1.3~6.5× 손해**로 feasible 유지(prob_5 1.34×, prob_22 1.43×, prob_14 4.06×, prob_1 6.54×).
+소형·저난도일수록 손해 작음 → 진짜 소형인 P1/P2(43k/85k)는 손해 작을 것으로 기대.
+
+**구현 (`solver.solve()` 분기, 대형 경로 무변경)**
+```python
+# 1) narrow greedy로 probe (소형이면 이게 곧 제출 해)
+narrow_a = _greedy_assignments(seed=0, max_entries=16, max_pos=40, budget=min(0.3*예산, 20s))
+if compute_objective(narrow_a) < _SMALL_OBJ_THRESHOLD:    # 소형/P3-like
+    return _ensure_feasible(narrow_a)        # wide/local/multistart 미실행 → FP-취약 배치 원천차단
+# 2) 대형(P4/P5/P6): #5 wide+local 그대로, 잔여 예산(~45s/60s)
+...
+```
+- 제출 해는 **실제로 다른 해**(narrow ≠ wide). `_ensure_feasible`은 그 위에서 한 번 더 검증,
+  설령 narrow도 local-infeasible이면 sequential로 교체(no-op 아님).
+
+**검증**
+- 회귀 **6/6** (신규 `test_p3like_quarantine`: 소형→narrow 경로 확인 + 대형→wide, 양쪽 feasible).
+- 빌드 smoke **양 경로**: prob_5(narrow) FEASIBLE obj=147,983 / prob_21(wide) FEASIBLE.
+- 라우팅 검증(30s): 소형 4개→narrow·feasible, 대형 4개→wide·feasible.
+- 훈련 분류(narrow probe): 소형=prob_5/14/1/22 등(목적값<3.5M), 대형=prob_29/21/38/40 등(≥3.5M).
+
+**기대 결과 / 리스크**
+- 기대: **P3 feasible 복구**(narrow가 #1처럼 서버-feasible). P1/P2는 narrow 손해 감수, P4/P5/P6 무변경.
+- 잔여 리스크: ① narrow greedy도 P3에서 서버-infeasible할 가능성(낮음; #1 실증). ② P3의 narrow
+  목적값이 3.5M↑면 미감지(낮음; #1=760k). 둘 다 발생 시 추가 격리 강화 필요.
+→ 제출 후 **P3 feasible 여부 + P1~P6 점수**를 아래에 기록.
 
 <!-- 다음 제출 결과를 여기에 추가 -->

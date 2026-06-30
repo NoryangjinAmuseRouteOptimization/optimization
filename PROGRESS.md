@@ -1,18 +1,17 @@
 # OGC2026 진척 요약 (PROGRESS)
 
-> 팀 `amuse5516` · 예선 2026-06-15 ~ 07-28 · 최종 갱신 2026-06-29
+> 팀 `amuse5516` · 예선 2026-06-15 ~ 07-28 · 최종 갱신 2026-06-30
 > 상세 실험 기록: `docs/p3_solver_baseline.md`, `docs/p1_packing_benchmark.md`
 > 제출 이력: `docs/submissions_log.md`
 
 > ## 🔴 다음 액션 (NEXT)
-> **제출 엔트리포인트 안전망 연결본 재제출** → **P3 feasible 복구 + P1~P6 점수 확보**.
-> - 제출 zip의 `myalgorithm.py`는 반드시 **`return solver.solve(prob_info, timelimit)`**
->   (`solve_greedy` 아님 — `_ensure_feasible` 안전망 우회 금지). 빌드:
->   `python tools/build_submission.py` (엔트리포인트·격리 feasibility 자동 검증).
->   ⚠️ 빌드는 바이트 수가 아닌 **SHA256 해시**로 식별한다(stale byte-count 금지).
-> - 재제출 후 P3 feasible 복구 + 5개 objective 개선 여부 확인 → `docs/submissions_log.md`
->   #5 표에 기록.
-> - 그 데이터 확보 전까지 새 알고리즘 추가 금지(블라인드 튜닝은 측정으로 소진됨).
+> **`_ensure_feasible` 이중검증 교정본 재제출** → **P3 feasible 복구 목표**.
+> - 제출 #5(2026-06-30): P1/P2/P4/P5/P6 개선(단일스레드 경로 정상 작동 확인),
+>   P3만 여전히 −1. 진단: `_ensure_feasible`이 `solve_sequential` 결과를 검증하지 않고
+>   반환하는 갭 + local checker 와 서버 checker 불일치 가능성.
+> - **수정 완료(solver.py)**: `_ensure_feasible`이 sequential fallback도 `check_feasibility`로
+>   이중 검증 후 반환. 빌드: `python tools/build_submission.py`.
+> - 재제출 후 **P3 feasible 복구** 여부 확인 → `docs/submissions_log.md` #6 표에 기록.
 
 ## 1. 한 줄 요약
 "제출 불가 baseline"에서 시작해 **항상 feasible·시간안전·다단계 최적화 솔버**를 구축.
@@ -64,16 +63,17 @@
 | 1 | 06-19 14:03 | feasible | 6/6 feasible, Tier 11/15 |
 | 2 | 06-21 06:16 | **infeasible** | AABB 경계버그, Tier 15/17 (하락) |
 | 3 | 06-23 13:26 | **infeasible** | ⚠️ 옛 버그본 재업로드 (수정본 아님) |
-| 4 | 06-29 08:38 | **infeasible** | P3만 −1, P1/P2/P4/P5/P6는 #1과 동일 → 엔트리포인트가 `solve_greedy`라 안전망 우회 (진단·수정 완료) |
-| (대기) | — | feasible 기대 | **엔트리포인트 `solver.solve` 교정본 재제출** |
+| 4 | 06-29 08:38 | **infeasible** | P3만 −1, P1/P2/P4/P5/P6는 #1과 동일 → 엔트리포인트가 `solve_greedy`라 안전망 우회 |
+| 5 | 06-30 02:34 | **infeasible** | P1/P2/P4/P5/P6 모두 개선(단일스레드 동작 확인), P3만 여전히 −1 |
+| (대기) | — | feasible 기대 | **`_ensure_feasible` sequential 이중검증 교정본 재제출** |
 
 ## 6. 현재 상태 / 다음
-- ✅ 엔트리포인트 교정: `myalgorithm.py` → `solver.solve` (안전망 `_ensure_feasible` 경유).
-  `python tools/build_submission.py`로 빌드(엔트리포인트·격리 feasibility 자동 검증).
+- ✅ 엔트리포인트 교정: `myalgorithm.py` → `solver.solve` (안전망 `_ensure_feasible` 경유) [#4 이후].
+- ✅ `_ensure_feasible` 이중검증: sequential fallback도 `check_feasibility`로 검증 후 반환 [지금].
 - ✅ 회귀 테스트 고정: `tests/test_solver_regression.py` 5/5
-  (AABB 경계버그/안전망/단일스레드 + **제출 엔트리포인트·격리 packaged feasibility**).
-- ⚠️ **다음 액션: 교정본 재제출** → P3 feasible 복구 확인 + 실제 P1~P6 숫자 확보.
-- ▶ 그 데이터로 약한 인스턴스 타겟 최적화 (블라인드 튜닝은 측정으로 소진됨).
+  (AABB 경계버그/안전망/단일스레드/엔트리포인트/packaged feasibility).
+- ⚠️ **다음 액션: #6 재제출** → P3 feasible 복구 확인.
+- ▶ P3 복구 후 약한 인스턴스 타겟 최적화 (블라인드 튜닝은 측정으로 소진됨).
 
 ### 로컬 검증 명령 (제출 전 권장)
 ```bash

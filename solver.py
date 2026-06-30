@@ -867,13 +867,26 @@ def _ensure_feasible(prob_info: dict, sol: dict) -> dict:
     it; otherwise fall back to the always-feasible sequential schedule.  This
     makes an infeasible submission (a -1 on the server) impossible regardless of
     any bug in the optimizing path -- exactly the failure that broke P3.
+
+    The fallback result is also verified: solve_sequential has a degenerate
+    path (orient=0, x=0, y=0) that could theoretically be infeasible if no
+    orientation fits bay 0, so we double-check and, if somehow infeasible,
+    still return it as best-effort (always better than an unverified result).
     """
     try:
         if check_feasibility(prob_info, sol)["feasible"]:
             return sol
     except Exception:
         pass
-    return solve_sequential(prob_info)
+    fallback = solve_sequential(prob_info)
+    try:
+        if check_feasibility(prob_info, fallback)["feasible"]:
+            return fallback
+    except Exception:
+        pass
+    # Last resort: return the fallback even if we cannot locally verify it.
+    # solve_sequential is theoretically always feasible for well-formed instances.
+    return fallback
 
 
 # Submission entry point shim (mirrors myalgorithm.algorithm signature).

@@ -5,22 +5,17 @@
 > 제출 이력: `docs/submissions_log.md`
 
 > ## 🔴 다음 액션 (NEXT)
-> **#6 P3-like 격리(quarantine) 재제출** → **P3 −1 제거(feasible 복구)가 유일 목표**.
-> P3 점수 욕심 버림. P1/P2 약간의 손해는 감수(−1 제거 우선).
-> - 제출 #5: P1/P2/P4/P5/P6 개선, P3만 −1. 근본원인: **wide 탐색+local search(#5부터
->   서버 실행)가 P3에서 FP-취약 near-touch 배치를 생성** → 서버 Shapely가 reject(local은
->   FEASIBLE → `_ensure_feasible` 안전망이 못 잡음). P3 데이터 없어 로컬 재현 불가.
-> - **핵심 통찰**: #1~#4의 P1~P6 점수(P3=760k 포함)는 전부 **narrow 공존 greedy
->   (seed 0, max_entries=16, max_pos=40) fallback**의 결과였고, 그때 **P3는 feasible**이었다.
->   즉 narrow greedy 프로필 = P3 서버-feasible 검증된 경로.
-> - **전략(solver.py `solve()` 분기 추가)**:
->   1. narrow greedy로 먼저 probe → 목적값 < `_SMALL_OBJ_THRESHOLD`(3.5M)면 **소형/P3-like**로
->      판정하고 **narrow 해를 그대로 제출**(wide/local/multistart 미실행 → FP-취약 배치 원천차단).
->   2. 대형(P4/P5/P6, narrow 목적값 ≥ 3.5M)은 **#5 wide optimizer 그대로**(잔여 예산 ~45s/60s,
->      사실상 무손상).
->   - 임계값 근거: narrow greedy 목적값 = #1 점수 → P3(760k)와 P4(15.27M) 사이 ~4.4× 간극 중앙.
-> - 검증: 회귀 6/6, 빌드 양 경로(narrow+wide) feasibility smoke, 라우팅/feasibility 40개 확인.
-> - 재제출 후 결과 → `docs/submissions_log.md` #6 표에 기록.
+> **#6 결과: P3만 여전히 −1. 격리 전제가 틀림 → 근본 재설계 필요.**
+> - #6(06-30 15:01): **P4/P5/P6 −29/−27/−70% 대폭개선**(wide 격리 성공), P1/P2 #1과 동일(narrow
+>   정상). **그러나 P3는 여전히 −1.**
+> - **왜 실패**: 전제 "narrow greedy = #1의 P3-feasible 프로필"이 거짓. #1(`0f7abce`)은
+>   **AABB fast-path(`3684ce1`)·wide 탐색·경계수정 이전** 코드 → 그 feasible P3 코드는 더 이상
+>   그대로 없음. 오늘 narrow도 드리프트된 공존/경계 로직 공유 → P3 배치가 local-feasible/서버-
+>   infeasible로 남음(안전망도 못 잡음).
+> - **다음 방향(재설계 후보)**: 소형/P3-like 경로를 **checker 버전 무관 구조적 feasible**로.
+>   **컬럼 패킹**: 공존 블록 x-구간 마진≥1 분리 → 충돌·크레인 모두 순수 AABB로 보장(Shapely
+>   무의존). sequential(1000× 악화)보다 우수. → 훈련셋 feasibility·목적값 비용 측정 후 적용.
+> - 다음 제출 가능: **2026-07-01 03:01:59 UTC** 이후(#6 +12h).
 
 ## 1. 한 줄 요약
 "제출 불가 baseline"에서 시작해 **항상 feasible·시간안전·다단계 최적화 솔버**를 구축.
@@ -85,7 +80,7 @@
 | 3 | 06-23 13:26 | **infeasible** | ⚠️ 옛 버그본 재업로드 (수정본 아님) |
 | 4 | 06-29 08:38 | **infeasible** | P3만 −1, P1/P2/P4/P5/P6는 #1과 동일 → 엔트리포인트가 `solve_greedy`라 안전망 우회 |
 | 5 | 06-30 02:34 | **infeasible** | P1/P2/P4/P5/P6 모두 개선(단일스레드 동작 확인), P3만 여전히 −1 |
-| (대기) | — | **feasible 기대** | **P3-like 격리: 소형은 narrow greedy로 우회, 대형은 wide 유지** |
+| 6 | 06-30 15:01 | **infeasible** | 격리: P1/P2 #1과 동일(narrow 정상)·**P4/P5/P6 −29/−27/−70%**(wide 큰개선)·**P3만 여전히 −1** |
 
 ## 6. 현재 상태 / 다음
 - ✅ 엔트리포인트 교정: `myalgorithm.py` → `solver.solve` (안전망 `_ensure_feasible` 경유) [#4 이후].

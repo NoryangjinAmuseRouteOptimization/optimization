@@ -217,52 +217,104 @@ def test_packaged_zip_feasible() -> bool:
     return ok
 
 
+def _coexist_x_disjoint(prob, assignments) -> bool:
+    """True iff every pair of same-bay, time-overlapping blocks has x-disjoint
+    bounding boxes (the column-packing guarantee that makes a solution feasible
+    on any checker version)."""
+    geom = placement.GeometryCache(prob)
+    per_bay = {}
+    for a in assignments:
+        per_bay.setdefault(a["bay_id"], []).append(a)
+    for bay_id, aa in per_bay.items():
+        boxes = []
+        for a in aa:
+            b = Block(block_id=a["block_id"], block_data=prob["blocks"][a["block_id"]],
+                      x=a["x"], y=a["y"], orient_idx=a["orient_idx"])
+            boxes.append((a["entry_time"], a["exit_time"], b.bounding_rect()))
+        for i in range(len(boxes)):
+            e1, x1, bb1 = boxes[i]
+            for j in range(i + 1, len(boxes)):
+                e2, x2, bb2 = boxes[j]
+                if e1 < x2 and e2 < x1:                 # time overlap
+                    # x-ranges must be clearly disjoint (>= ~1 gap, allow 0.5 tol)
+                    if not (bb1[2] <= bb2[0] - 0.5 or bb2[2] <= bb1[0] - 0.5):
+                        return False
+    return True
+
+
 def test_p3like_quarantine() -> bool:
     """
-    Small instance -> conservative narrow greedy (the server-feasible P3 profile);
-    large instance -> wide optimizer.  Both feasible.
+    Three-way routing on the narrow-greedy objective:
+      * P1/P2 band (< _COLUMN_PACK_LO)          -> narrow greedy (returned verbatim),
+      * P3 band (.. < _SMALL_OBJ_THRESHOLD)      -> COLUMN PACKING (x-disjoint coexist),
+      * large (>= _SMALL_OBJ_THRESHOLD)          -> wide optimizer.
+    All feasible; the P3-band solution must satisfy the x-disjoint guarantee.
     """
     ok = True
     L = 10.0
 
-    # (a) small instance: must take the narrow path and return exactly it.
+    # (a) P1/P2 band: narrow path, returned verbatim.
     prob_s = json.load(open(ROOT / "data" / "train" / "prob_5.json"))
     narrow = solver._greedy_assignments(prob_s, L, seed=0, key_mode="exit",
                                         max_entries=16, max_pos=40)
     narrow_obj = solver.compute_objective(prob_s, narrow)[0]
-    if narrow_obj >= solver._SMALL_OBJ_THRESHOLD:
+    if narrow_obj >= solver._COLUMN_PACK_LO:
         ok = False
-        print(f"  [FAIL] prob_5 narrow objective {narrow_obj:.0f} not below "
-              f"threshold {solver._SMALL_OBJ_THRESHOLD} (test instance assumption)")
+        print(f"  [FAIL] prob_5 narrow obj {narrow_obj:.0f} not below "
+              f"_COLUMN_PACK_LO {solver._COLUMN_PACK_LO} (test instance assumption)")
     sol_s = solver.solve(prob_s, L)
     r_s = check_feasibility(prob_s, sol_s)
     obj_s = r_s["objective"]
-    # The small path returns the narrow greedy verbatim, so the objective must
-    # match the narrow probe (not the much-lower wide objective) -- i.e. the wide
-    # path was NOT used.  Allow a tiny tolerance for deadline jitter.
+    # Narrow path keeps the objective in the narrow band (column packing would
+    # inflate it above _COLUMN_PACK_LO; the wide path would drop it far lower but
+    # is only taken for large instances).  The probe uses a shorter budget than a
+    # full L-second narrow run, so we check the band, not an exact match.
     if not r_s["feasible"]:
         ok = False
-        print("  [FAIL] small instance (prob_5) infeasible")
-    elif abs(obj_s - narrow_obj) > max(1.0, 0.02 * narrow_obj):
+        print("  [FAIL] P1/P2-band instance (prob_5) infeasible")
+    elif obj_s >= solver._COLUMN_PACK_LO:
         ok = False
-        print(f"  [FAIL] small instance not on narrow path: solve obj {obj_s:.0f} "
-              f"!= narrow obj {narrow_obj:.0f} (wide path leaked in?)")
+        print(f"  [FAIL] P1/P2-band not on narrow path: solve obj {obj_s:.0f} "
+              f">= _COLUMN_PACK_LO {solver._COLUMN_PACK_LO} (column/other path leaked in?)")
 
-    # (b) large instance: narrow objective above threshold -> routed to wide.
+    # (b) P3 band: must column-pack (x-disjoint coexistence) and be feasible.
+    prob_p = json.load(open(ROOT / "data" / "train" / "prob_22.json"))
+    narrow_p = solver.compute_objective(
+        prob_p, solver._greedy_assignments(prob_p, L, seed=0, key_mode="exit",
+                                           max_entries=16, max_pos=40))[0]
+    if not (solver._COLUMN_PACK_LO <= narrow_p < solver._SMALL_OBJ_THRESHOLD):
+        ok = False
+        print(f"  [FAIL] prob_22 narrow obj {narrow_p:.0f} not in P3 band "
+              f"[{solver._COLUMN_PACK_LO}, {solver._SMALL_OBJ_THRESHOLD}) (assumption)")
+    # direct column-packing construction must be feasible AND x-disjoint
+    col = solver._greedy_assignments(prob_p, L, seed=0, key_mode="exit",
+                                     max_entries=16, max_pos=40,
+                                     x_gap=solver._COLUMN_X_GAP)
+    if not check_feasibility(prob_p, {"operations": solver._build_operations(col)})["feasible"]:
+        ok = False
+        print("  [FAIL] column-packing construction (prob_22) infeasible")
+    if not _coexist_x_disjoint(prob_p, col):
+        ok = False
+        print("  [FAIL] column-packing produced a NON-x-disjoint coexisting pair")
+    sol_p = solver.solve(prob_p, L)
+    if not check_feasibility(prob_p, sol_p)["feasible"]:
+        ok = False
+        print("  [FAIL] P3-band instance (prob_22) infeasible via solve()")
+
+    # (c) large instance: narrow objective above threshold -> routed to wide.
     prob_l = json.load(open(ROOT / "data" / "train" / "prob_40.json"))
     narrow_l = solver._greedy_assignments(prob_l, L, seed=0, key_mode="exit",
                                           max_entries=16, max_pos=40)
     if solver.compute_objective(prob_l, narrow_l)[0] < solver._SMALL_OBJ_THRESHOLD:
         ok = False
-        print("  [FAIL] prob_40 narrow objective below threshold "
-              "(test instance assumption)")
+        print("  [FAIL] prob_40 narrow objective below threshold (assumption)")
     sol_l = solver.solve(prob_l, L)
     if not check_feasibility(prob_l, sol_l)["feasible"]:
         ok = False
         print("  [FAIL] large instance (prob_40) infeasible")
 
     print(f"  test_p3like_quarantine: {'PASS' if ok else 'FAIL'} "
-          f"(small->narrow obj={obj_s:.0f}, large->wide, both feasible)")
+          f"(P1/P2->narrow, P3->column x-disjoint, large->wide; all feasible)")
     return ok
 
 

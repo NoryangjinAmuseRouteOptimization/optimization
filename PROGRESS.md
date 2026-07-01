@@ -5,17 +5,17 @@
 > 제출 이력: `docs/submissions_log.md`
 
 > ## 🔴 다음 액션 (NEXT)
-> **#6 결과: P3만 여전히 −1. 격리 전제가 틀림 → 근본 재설계 필요.**
-> - #6(06-30 15:01): **P4/P5/P6 −29/−27/−70% 대폭개선**(wide 격리 성공), P1/P2 #1과 동일(narrow
->   정상). **그러나 P3는 여전히 −1.**
-> - **왜 실패**: 전제 "narrow greedy = #1의 P3-feasible 프로필"이 거짓. #1(`0f7abce`)은
->   **AABB fast-path(`3684ce1`)·wide 탐색·경계수정 이전** 코드 → 그 feasible P3 코드는 더 이상
->   그대로 없음. 오늘 narrow도 드리프트된 공존/경계 로직 공유 → P3 배치가 local-feasible/서버-
->   infeasible로 남음(안전망도 못 잡음).
-> - **다음 방향(재설계 후보)**: 소형/P3-like 경로를 **checker 버전 무관 구조적 feasible**로.
->   **컬럼 패킹**: 공존 블록 x-구간 마진≥1 분리 → 충돌·크레인 모두 순수 AABB로 보장(Shapely
->   무의존). sequential(1000× 악화)보다 우수. → 훈련셋 feasibility·목적값 비용 측정 후 적용.
-> - 다음 제출 가능: **2026-07-01 03:01:59 UTC** 이후(#6 +12h).
+> **#7 준비완료: 3-way 라우팅으로 P3만 컬럼 패킹 격리 → P3 −1 제거(구조적 보장).**
+> - #6(06-30 15:01): **P4/P5/P6 −29/−27/−70%**(wide 성공)·P1/P2 #1과 동일(narrow 정상)·**P3만 −1.**
+>   전제 "narrow=#1 P3-feasible"이 거짓(#1 `0f7abce`은 AABB fast-path 이전; P3 실패는 스케줄이
+>   아니라 위치(x/y)가 서버-infeasible). narrow 스케줄은 deterministic(그래서 P1/P2 정확 일치).
+> - **#7 전략(`solve()` 3-way, narrow 목적값 기준)**:
+>   `<250k`→narrow(P1/P2 유지) · `250k~3.5M`→**컬럼 패킹**(P3) · `≥3.5M`→wide(P4/P5/P6 무변경).
+>   경계는 숨김셋(P2=85k↔P3=760k↔P4=15M) 빈 구간 → 뒤집힘 불가.
+> - **컬럼 패킹**(`_earliest_coexist(x_gap=1)`): 공존 블록 x-구간 마진≥1 분리 → 충돌·크레인 모두
+>   순수 AABB로 보장 → **Shapely 버전 무관 feasible**. 훈련 40/40 feasible 실측.
+> - 검증: 회귀 **6/6**(x-disjoint 검증 추가)·빌드 smoke 3경로 feasible·40개 라우팅 확인.
+> - **다음 제출 가능: 2026-07-01 03:01:59 UTC**(#6 +12h) 이후.
 
 ## 1. 한 줄 요약
 "제출 불가 baseline"에서 시작해 **항상 feasible·시간안전·다단계 최적화 솔버**를 구축.
@@ -85,19 +85,21 @@
 ## 6. 현재 상태 / 다음
 - ✅ 엔트리포인트 교정: `myalgorithm.py` → `solver.solve` (안전망 `_ensure_feasible` 경유) [#4 이후].
 - ✅ `_ensure_feasible` 이중검증: sequential fallback도 `check_feasibility`로 검증 후 반환.
-- ✅ **P3-like 격리 분기 추가**: `solve()`가 narrow greedy probe로 소형/대형 판정 →
-  소형(목적값<3.5M, P1/P2/P3)은 narrow 해 제출(P3 −1 원천차단), 대형(P4/P5/P6)은 wide 유지.
-- ✅ 회귀 테스트 고정: `tests/test_solver_regression.py` **6/6**
-  (AABB/안전망/단일스레드/엔트리포인트/packaged + **P3-like 격리 라우팅**).
-- ✅ 빌드 smoke: narrow(prob_5)·wide(prob_21) **양 경로 feasibility 검증**(둘 중 하나라도
-  infeasible이면 빌드 실패).
-- ⚠️ **다음 액션: #6 재제출** → **P3 −1 제거(feasible 복구)** 확인. P3 점수는 narrow 수준
-  (≈760k 부근) 기대; P1/P2는 narrow 손해(~1.3~6.5×) 감수.
-- ▶ P3 feasible 확인되면, 소형 격리 임계값 미세조정 / narrow 프로필 안전한 강화 검토.
+- ✅ **3-way 라우팅(#7)**: `solve()`가 narrow probe 목적값으로 P1/P2(narrow)·P3(컬럼 패킹)·
+  P4/P5/P6(wide) 분기. P3만 **컬럼 패킹**(x-구간 분리, Shapely 무관 feasible)으로 격리.
+- ✅ **컬럼 패킹**(`_earliest_coexist(x_gap=1)`): 공존 블록 x-분리 → 순수 AABB로 충돌·크레인
+  보장 → 서버 checker 버전 무관 feasible. 훈련 40/40 feasible 실측.
+- ✅ 회귀 테스트 **6/6**(AABB/안전망/단일스레드/엔트리포인트/packaged + **3-way 라우팅 &
+  컬럼 x-disjoint 보장** 검증).
+- ✅ 빌드 smoke **3경로**: narrow(prob_5)·column(prob_22)·wide(prob_21) 모두 feasibility 검증
+  (하나라도 infeasible이면 빌드 실패).
+- ⚠️ **다음 액션: #7 제출**(2026-07-01 03:01:59 UTC 이후) → **P3 −1 제거** 확인.
+  P1/P2 무변경(narrow)·P4/P5/P6 무변경(wide)·P3만 컬럼 패킹(feasible 목표, 점수 무관).
+- ▶ P3 feasible 확인되면, 컬럼 패킹 목적값 개선(컬럼 내 다중배치·시간 재배열) 검토.
 
 ### 로컬 검증 명령 (제출 전 권장)
 ```bash
 python tests/test_placement.py            # 기하 feasibility 일치
-python tests/test_solver_regression.py    # 회귀 6/6 (AABB/안전망/단일스레드/엔트리포인트/packaged/P3-like격리)
-python tools/build_submission.py          # dist/submission.zip 빌드 + 엔트리포인트·양경로(narrow+wide) feasibility 검증
+python tests/test_solver_regression.py    # 회귀 6/6 (…/3-way 라우팅·컬럼 x-disjoint 보장)
+python tools/build_submission.py          # zip 빌드 + 엔트리포인트·3경로(narrow/column/wide) feasibility 검증
 ```

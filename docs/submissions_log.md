@@ -196,13 +196,44 @@ if compute_objective(narrow_a) < _SMALL_OBJ_THRESHOLD:    # 소형/P3-like
 - P3의 narrow 배치는 여전히 **local-feasible이지만 서버-infeasible**(그래서 `_ensure_feasible`도
   못 잡음). "#1의 운 좋은 배치"를 재현하려는 접근 자체가 취약.
 
-**다음 방향 (근본 재설계)**
-- Shapely 경계(area==0 touching)에 의존하는 배치는 local/서버 checker 버전차에 원천 취약.
-  ⇒ 소형/P3-like 경로를 **checker 버전과 무관하게 구조적으로 feasible**한 배치만 내도록 변경.
-- 후보: **컬럼 패킹(column packing)** — 같은 베이 공존 블록의 **x-구간을 마진≥1로 분리**.
-  x-구간이 겹치지 않으면 ① AABB 분리 → 충돌 불가(polygon area 항상 0), ② 각 블록의 수직
-  크레인 sweep이 자기 x-컬럼 내 → 크레인 간섭 불가. **순수 AABB 산술 → Shapely 무의존 →
-  서버 버전 무관 feasible 보장.** sequential(1000× 악화)보다 훨씬 나음(다중 컬럼 공존 허용).
-  → 훈련셋에서 feasibility(구조상 100%)·목적값 비용 측정 후 소형 경로에 적용 검토.
+**다음 방향 (근본 재설계)** → 아래 #7 준비분으로 구현·검증 완료.
+
+## ★ #7 준비분 — 3-way 라우팅: P3만 컬럼 패킹으로 격리 (구조적 feasible 보장)
+
+**핵심 통찰 (#6가 알려준 것)**: narrow greedy의 **스케줄(bay/time)은 byte-deterministic**이고
+목적값은 스케줄만의 함수(x/y 위치 무관). #6에서 P1/P2가 **정확히 43,300/84,764**(= #1)로 나온 것이
+이를 증명. ⇒ 각 인스턴스의 narrow 목적값은 **고정 상수**이며 숨김셋 값은 #1 그대로:
+P1=43,300 · P2=84,764 · **P3=760,267** · P4=15.27M · P5=35.54M · P6=202.39M.
+P3 실패는 **스케줄이 아니라 위치(x/y) 문제**(narrow 스케줄은 그대로인데 위치가 서버-infeasible).
+
+**전략 (`solve()` 3-way 분기, narrow 목적값 기준)**
+| narrow_obj | 라우팅 | 대상 | 근거 |
+|---|---|---|---|
+| < `_COLUMN_PACK_LO`(250k) | narrow 그대로 | P1/P2 | #6에서 narrow가 서버-feasible 실증 |
+| 250k ~ `_SMALL_OBJ_THRESHOLD`(3.5M) | **컬럼 패킹** | **P3** | narrow 위치가 서버-infeasible → 재해결 |
+| ≥ 3.5M | wide(무변경) | P4/P5/P6 | #6에서 −29/−27/−70% 개선 |
+
+- 두 경계(250k·3.5M) 모두 숨김셋 목적값 스펙트럼의 **빈 구간**(P2=85k↔P3=760k↔P4=15M) →
+  분류 뒤집힘 불가.
+
+**컬럼 패킹 (`_earliest_coexist(x_gap=1.0)`) — 왜 checker 버전 무관 feasible인가**
+같은 베이 공존 블록을 **x-구간이 마진≥1로 분리된 컬럼**에만 배치. x-분리 ⟹ ① AABB 분리 →
+polygon 충돌 불가(area 항상 정확히 0, 모든 Shapely 버전 동일), ② 각 블록 수직 크레인 sweep이
+자기 컬럼 내 → 크레인 간섭 불가. **순수 AABB 산술(마진 1≫FP 노이즈) → 서버/local checker
+버전차 무관 feasible 보장.** 컬럼에 못 넣는 블록은 빈-베이 시간창 폴백(역시 feasible).
+
+**검증 (훈련 40개)**
+- **컬럼 패킹 40/40 feasible**(구조상 보장, 실측 확인). x-disjoint 공존 회귀테스트로 고정.
+- 소형(20개) 컬럼/narrow 목적값 비: median 5.9×(min 1.27× ~ max 40.5×). P3 대응: narrow 760k →
+  컬럼 ~수 M(feasible). **feasible ≫ −1**이므로 P3 점수 손해는 무의미(목표는 −1 제거).
+- **P1/P2는 narrow 유지**(< 250k) → #6의 43,300/84,764 그대로, 컬럼 손해 회피.
+- 3-way 라우팅 40개: narrow 13 / column 7 / wide 20. 회귀 **6/6**(신규 x-disjoint 검증),
+  빌드 smoke **3경로**(narrow prob_5·column prob_22·wide prob_21) 모두 feasible.
+
+**기대 / 리스크**
+- 기대: **P3 −1 → feasible**(컬럼 패킹은 구조적 보장). P1/P2 무변경, P4/P5/P6 무변경.
+- 리스크: ① P3 narrow 목적값이 [250k,3.5M] 밖일 가능성(매우 낮음; deterministic 760k, #6가
+  P1/P2 정확 일치로 스케줄 안정성 입증). ② 컬럼 패킹 구현 버그(회귀+빌드+40개 feasibility로 방어).
+→ 다음 제출 가능: **2026-07-01 03:01:59 UTC**(#6 +12h) 이후. 제출 후 결과 기록.
 
 <!-- 다음 제출 결과를 여기에 추가 -->

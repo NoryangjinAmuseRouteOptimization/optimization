@@ -122,14 +122,15 @@ def validate(zip_path: pathlib.Path, instance: pathlib.Path, timelimit: float):
 
     # 2. Functional check in an ISOLATED dir (only the unzipped files on path),
     #    run as a child process so nothing from the repo leaks in.  We smoke-test
-    #    BOTH routing paths so a regression in either fails the build:
-    #      * a SMALL instance -> the P3-like quarantine / narrow-greedy path
-    #        (the conservative solution that keeps P3 feasible on the server),
-    #      * the given (large) instance -> the wide optimizer path.
-    #    If the safe path ever produces a locally-infeasible result we must NOT
-    #    ship it -- the build fails instead.
-    small_inst = (ROOT / "data" / "train" / "prob_5.json").resolve()
-    instances = [small_inst, instance.resolve()]
+    #    ALL THREE routing paths so a regression in any fails the build:
+    #      * prob_5  (narrow band)  -> P1/P2 path (narrow greedy),
+    #      * prob_22 (P3 band)      -> column-packing path (the P3-feasibility fix),
+    #      * the given (large) inst -> the wide optimizer path.
+    #    If any path produces a locally-infeasible result we must NOT ship it --
+    #    the build fails instead.
+    narrow_inst = (ROOT / "data" / "train" / "prob_5.json").resolve()
+    column_inst = (ROOT / "data" / "train" / "prob_22.json").resolve()
+    instances = [narrow_inst, column_inst, instance.resolve()]
     with tempfile.TemporaryDirectory() as td:
         tdp = pathlib.Path(td)
         with zipfile.ZipFile(zip_path) as z:
@@ -152,7 +153,7 @@ def validate(zip_path: pathlib.Path, instance: pathlib.Path, timelimit: float):
             print(f"result    : {out}")
             if res.returncode != 0:
                 raise SystemExit(f"submission FAILED isolated feasibility check on {inst.name}")
-    print("OK: submission self-contained and feasible (both routing paths).")
+    print("OK: submission self-contained and feasible (all routing paths).")
 
 
 def main():

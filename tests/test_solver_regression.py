@@ -35,7 +35,7 @@ server execution model:
      instance to the conservative NARROW greedy (seed 0, max_entries=16,
      max_pos=40 -- the #1-era profile that was server-feasible on P3), returning
      exactly that solution and not the wide/local path, and (b) route a large
-     instance (narrow objective above _SMALL_OBJ_THRESHOLD) to the wide optimizer.
+     instance (narrow objective above _WIDE_LO) to the wide optimizer.
      Both must be feasible.  This pins the fix for the P3 -1 that the wide path
      reintroduced on the server while local check_feasibility kept passing.
 
@@ -217,104 +217,144 @@ def test_packaged_zip_feasible() -> bool:
     return ok
 
 
-def _coexist_x_disjoint(prob, assignments) -> bool:
-    """True iff every pair of same-bay, time-overlapping blocks has x-disjoint
-    bounding boxes (the column-packing guarantee that makes a solution feasible
-    on any checker version)."""
-    geom = placement.GeometryCache(prob)
+def _independent_structural_check(prob, assignments) -> bool:
+    """
+    Test-side re-implementation of the structural certificate (kept independent
+    of solver._verify_structural so a bug there cannot self-certify): every
+    same-bay pair must be time-separated by >= 1 (no shared timestamps, no
+    ordering dependence) OR x-disjoint by >= 1 unit (no collision / crane
+    obstruction possible on any geometry library).  Pure AABB, no Shapely.
+    """
     per_bay = {}
     for a in assignments:
-        per_bay.setdefault(a["bay_id"], []).append(a)
-    for bay_id, aa in per_bay.items():
-        boxes = []
-        for a in aa:
-            b = Block(block_id=a["block_id"], block_data=prob["blocks"][a["block_id"]],
-                      x=a["x"], y=a["y"], orient_idx=a["orient_idx"])
-            boxes.append((a["entry_time"], a["exit_time"], b.bounding_rect()))
+        b = Block(block_id=a["block_id"], block_data=prob["blocks"][a["block_id"]],
+                  x=a["x"], y=a["y"], orient_idx=a["orient_idx"])
+        per_bay.setdefault(a["bay_id"], []).append(
+            (a["entry_time"], a["exit_time"], b.bounding_rect()))
+    for bay_id, boxes in per_bay.items():
+        W = prob["bays"][bay_id]["width"]; H = prob["bays"][bay_id]["height"]
+        for e, x, bb in boxes:
+            if not (bb[0] >= 0 and bb[1] >= 0 and bb[2] <= W and bb[3] <= H):
+                return False
         for i in range(len(boxes)):
             e1, x1, bb1 = boxes[i]
             for j in range(i + 1, len(boxes)):
                 e2, x2, bb2 = boxes[j]
-                if e1 < x2 and e2 < x1:                 # time overlap
-                    # x-ranges must be clearly disjoint (>= ~1 gap, allow 0.5 tol)
-                    if not (bb1[2] <= bb2[0] - 0.5 or bb2[2] <= bb1[0] - 0.5):
-                        return False
+                time_sep = (e1 >= x2 + 1) or (e2 >= x1 + 1)
+                x_sep = (bb1[2] + 1 <= bb2[0]) or (bb2[2] + 1 <= bb1[0])
+                if not (time_sep or x_sep):
+                    return False
     return True
 
 
 def test_p3like_quarantine() -> bool:
     """
-    Three-way routing on the narrow-greedy objective:
-      * P1/P2 band (< _COLUMN_PACK_LO)          -> narrow greedy (returned verbatim),
-      * P3 band (.. < _SMALL_OBJ_THRESHOLD)      -> COLUMN PACKING (x-disjoint coexist),
-      * large (>= _SMALL_OBJ_THRESHOLD)          -> wide optimizer.
-    All feasible; the P3-band solution must satisfy the x-disjoint guarantee.
+    Feasibility-first routing on the narrow-greedy probe objective:
+      * P1/P2 band (< _NARROW_HI)   -> narrow greedy kept,
+      * safe band  (< _WIDE_LO)     -> column packing carrying the structural
+                                       certificate (time-gap or x-gap for every
+                                       same-bay pair; floor fallback),
+      * large      (>= _WIDE_LO)    -> wide optimizer.
+    Also pins the floor solver's no-coexist + time-gap guarantee and its
+    explicit failure on a block that fits no bay (no silent degenerate).
     """
     ok = True
     L = 10.0
 
-    # (a) P1/P2 band: narrow path, returned verbatim.
+    # (a) P1/P2 band: narrow path kept.
     prob_s = json.load(open(ROOT / "data" / "train" / "prob_5.json"))
     narrow = solver._greedy_assignments(prob_s, L, seed=0, key_mode="exit",
                                         max_entries=16, max_pos=40)
     narrow_obj = solver.compute_objective(prob_s, narrow)[0]
-    if narrow_obj >= solver._COLUMN_PACK_LO:
+    if narrow_obj >= solver._NARROW_HI:
         ok = False
         print(f"  [FAIL] prob_5 narrow obj {narrow_obj:.0f} not below "
-              f"_COLUMN_PACK_LO {solver._COLUMN_PACK_LO} (test instance assumption)")
+              f"_NARROW_HI {solver._NARROW_HI} (test instance assumption)")
     sol_s = solver.solve(prob_s, L)
     r_s = check_feasibility(prob_s, sol_s)
     obj_s = r_s["objective"]
-    # Narrow path keeps the objective in the narrow band (column packing would
-    # inflate it above _COLUMN_PACK_LO; the wide path would drop it far lower but
-    # is only taken for large instances).  The probe uses a shorter budget than a
-    # full L-second narrow run, so we check the band, not an exact match.
     if not r_s["feasible"]:
         ok = False
         print("  [FAIL] P1/P2-band instance (prob_5) infeasible")
-    elif obj_s >= solver._COLUMN_PACK_LO:
+    elif obj_s >= solver._NARROW_HI:
         ok = False
         print(f"  [FAIL] P1/P2-band not on narrow path: solve obj {obj_s:.0f} "
-              f">= _COLUMN_PACK_LO {solver._COLUMN_PACK_LO} (column/other path leaked in?)")
+              f">= _NARROW_HI {solver._NARROW_HI} (another path leaked in?)")
 
-    # (b) P3 band: must column-pack (x-disjoint coexistence) and be feasible.
+    # (b) safe band (P3-like): column packing with the structural certificate.
     prob_p = json.load(open(ROOT / "data" / "train" / "prob_22.json"))
     narrow_p = solver.compute_objective(
         prob_p, solver._greedy_assignments(prob_p, L, seed=0, key_mode="exit",
                                            max_entries=16, max_pos=40))[0]
-    if not (solver._COLUMN_PACK_LO <= narrow_p < solver._SMALL_OBJ_THRESHOLD):
+    if not (solver._NARROW_HI <= narrow_p < solver._WIDE_LO):
         ok = False
-        print(f"  [FAIL] prob_22 narrow obj {narrow_p:.0f} not in P3 band "
-              f"[{solver._COLUMN_PACK_LO}, {solver._SMALL_OBJ_THRESHOLD}) (assumption)")
-    # direct column-packing construction must be feasible AND x-disjoint
+        print(f"  [FAIL] prob_22 narrow obj {narrow_p:.0f} not in safe band "
+              f"[{solver._NARROW_HI}, {solver._WIDE_LO}) (assumption)")
+    # direct column construction: solver certificate AND the independent check
     col = solver._greedy_assignments(prob_p, L, seed=0, key_mode="exit",
                                      max_entries=16, max_pos=40,
                                      x_gap=solver._COLUMN_X_GAP)
+    v_ok, v_reason = solver._verify_structural(prob_p, col)
+    if not v_ok:
+        ok = False
+        print(f"  [FAIL] column construction fails solver certificate: {v_reason}")
+    if not _independent_structural_check(prob_p, col):
+        ok = False
+        print("  [FAIL] column construction fails INDEPENDENT structural check "
+              "(shared timestamp with x-overlap, or gap < 1)")
     if not check_feasibility(prob_p, {"operations": solver._build_operations(col)})["feasible"]:
         ok = False
-        print("  [FAIL] column-packing construction (prob_22) infeasible")
-    if not _coexist_x_disjoint(prob_p, col):
-        ok = False
-        print("  [FAIL] column-packing produced a NON-x-disjoint coexisting pair")
+        print("  [FAIL] column construction (prob_22) locally infeasible")
     sol_p = solver.solve(prob_p, L)
     if not check_feasibility(prob_p, sol_p)["feasible"]:
         ok = False
-        print("  [FAIL] P3-band instance (prob_22) infeasible via solve()")
+        print("  [FAIL] safe-band instance (prob_22) infeasible via solve()")
 
-    # (c) large instance: narrow objective above threshold -> routed to wide.
+    # (c) large instance: probe above _WIDE_LO -> wide optimizer.
     prob_l = json.load(open(ROOT / "data" / "train" / "prob_40.json"))
     narrow_l = solver._greedy_assignments(prob_l, L, seed=0, key_mode="exit",
                                           max_entries=16, max_pos=40)
-    if solver.compute_objective(prob_l, narrow_l)[0] < solver._SMALL_OBJ_THRESHOLD:
+    if solver.compute_objective(prob_l, narrow_l)[0] < solver._WIDE_LO:
         ok = False
-        print("  [FAIL] prob_40 narrow objective below threshold (assumption)")
+        print("  [FAIL] prob_40 narrow objective below _WIDE_LO (assumption)")
     sol_l = solver.solve(prob_l, L)
     if not check_feasibility(prob_l, sol_l)["feasible"]:
         ok = False
         print("  [FAIL] large instance (prob_40) infeasible")
 
+    # (d) floor: no-coexist with >=1 time gaps, certificate passes, and a block
+    # that fits no bay raises InstanceFitError instead of a silent degenerate.
+    fl = solver.floor_assignments(prob_p)
+    v_ok, v_reason = solver._verify_structural(prob_p, fl)
+    if not v_ok or not _independent_structural_check(prob_p, fl):
+        ok = False
+        print(f"  [FAIL] floor schedule fails structural checks: {v_reason}")
+    by_bay = {}
+    for a in fl:
+        by_bay.setdefault(a["bay_id"], []).append((a["entry_time"], a["exit_time"]))
+    for j, iv in by_bay.items():
+        iv.sort()
+        for (e1, x1), (e2, x2) in zip(iv, iv[1:]):
+            if e2 < x1 + 1:
+                ok = False
+                print(f"  [FAIL] floor bay {j}: occupancies not gap-separated")
+                break
+    bad = {"bays": [{"width": 5, "height": 5}],
+           "blocks": [{"release_time": 0, "due_date": 10, "processing_time": 5,
+                       "workload": 1, "bay_preferences": [100],
+                       "shape": [{"orientation": 0,
+                                  "layers": [[[0.0, 0.0], [50.0, 0.0],
+                                              [50.0, 50.0], [0.0, 50.0]]]}]}],
+           "weights": {"w1": 1, "w2": 1, "w3": 1}}
+    try:
+        solver.floor_assignments(bad)
+        ok = False
+        print("  [FAIL] floor did NOT raise on a block that fits no bay")
+    except solver.InstanceFitError:
+        pass
+
     print(f"  test_p3like_quarantine: {'PASS' if ok else 'FAIL'} "
-          f"(P1/P2->narrow, P3->column x-disjoint, large->wide; all feasible)")
+          f"(narrow band / certified column / wide / gapped floor + explicit fit failure)")
     return ok
 
 

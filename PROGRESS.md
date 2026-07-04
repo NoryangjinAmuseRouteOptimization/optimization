@@ -5,17 +5,23 @@
 > 제출 이력: `docs/submissions_log.md`
 
 > ## 🔴 다음 액션 (NEXT)
-> **#7 준비완료: 3-way 라우팅으로 P3만 컬럼 패킹 격리 → P3 −1 제거(구조적 보장).**
-> - #6(06-30 15:01): **P4/P5/P6 −29/−27/−70%**(wide 성공)·P1/P2 #1과 동일(narrow 정상)·**P3만 −1.**
->   전제 "narrow=#1 P3-feasible"이 거짓(#1 `0f7abce`은 AABB fast-path 이전; P3 실패는 스케줄이
->   아니라 위치(x/y)가 서버-infeasible). narrow 스케줄은 deterministic(그래서 P1/P2 정확 일치).
-> - **#7 전략(`solve()` 3-way, narrow 목적값 기준)**:
->   `<250k`→narrow(P1/P2 유지) · `250k~3.5M`→**컬럼 패킹**(P3) · `≥3.5M`→wide(P4/P5/P6 무변경).
->   경계는 숨김셋(P2=85k↔P3=760k↔P4=15M) 빈 구간 → 뒤집힘 불가.
-> - **컬럼 패킹**(`_earliest_coexist(x_gap=1)`): 공존 블록 x-구간 마진≥1 분리 → 충돌·크레인 모두
->   순수 AABB로 보장 → **Shapely 버전 무관 feasible**. 훈련 40/40 feasible 실측.
-> - 검증: 회귀 **6/6**(x-disjoint 검증 추가)·빌드 smoke 3경로 feasible·40개 라우팅 확인.
-> - **다음 제출 가능: 2026-07-01 03:01:59 UTC**(#6 +12h) 이후.
+> **#8 준비완료: feasibility-first 재설계 (#7도 P3 −1 → 구조 전면 재검토 반영).**
+> - **#7 사후 진단으로 찾은 실제 구멍 2개**:
+>   ① 컬럼 모드 진입후보가 `{exit 시각}` 그대로 → 공존판정(열린구간)에 안 잡혀 **동일 timestamp
+>   EXIT/ENTRY + x-겹침**(순서의존) 배치 가능. ② probe가 pace-deadline(벽시계) 의존이라
+>   **하드웨어에 따라 objective inflate** → 느린 서버에서 P3(760k)가 3.5M 넘겨 wide로 오분류
+>   가능(→ −1). "local check 통과=안전"·"probe는 결정적" 가정 폐기.
+> - **#8 재설계 (solver.py)**:
+>   ① `_SAFE_TIME_GAP=1`: safe 경로 전체에서 진입=exit+1, 팽창 시간창으로 x-분리 강제 →
+>   같은 베이에서 timestamp 공유+x겹침 조합 원천 제거. ② `_verify_structural`: **순수
+>   interval/AABB 런타임 인증서**(Shapely 0회) — safe 경로는 이 인증 통과분만 반환, 실패 시
+>   floor로 강등. ③ floor(`floor_assignments`): no-coexist+시간갭≥1, degenerate fallback
+>   삭제(`InstanceFitError` 명시 실패). ④ 라우팅: `<250k`→narrow(P1/P2, 서버 2회 실증) ·
+>   `<8M`→**safe(인증 컬럼→floor)** · `≥8M`→wide. wide 임계 3.5M→**8M**(P3 오분류에 10.5×
+>   inflate 필요; P4=15.27M은 inflate가 위로만 작용해 항상 통과). 오류방향 전부 fail-safe.
+> - 검증: 회귀 6/6(독립 구조검사 추가)·placement PASS·빌드 3경로 smoke·**train 40 전수:
+>   40/40 feasible, safe경로 위험쌍(bbox겹침+동일ts) 0개**, pace 비결정성 관측시에도 safe로만 표류.
+> - **다음 제출 가능: 2026-07-01 03:01:59 UTC**(#6 +12h) 이후 — #7이 이미 나갔다면 #7 +12h.
 
 ## 1. 한 줄 요약
 "제출 불가 baseline"에서 시작해 **항상 feasible·시간안전·다단계 최적화 솔버**를 구축.

@@ -5,23 +5,17 @@
 > 제출 이력: `docs/submissions_log.md`
 
 > ## 🔴 다음 액션 (NEXT)
-> **#8 준비완료: feasibility-first 재설계 (#7도 P3 −1 → 구조 전면 재검토 반영).**
-> - **#7 사후 진단으로 찾은 실제 구멍 2개**:
->   ① 컬럼 모드 진입후보가 `{exit 시각}` 그대로 → 공존판정(열린구간)에 안 잡혀 **동일 timestamp
->   EXIT/ENTRY + x-겹침**(순서의존) 배치 가능. ② probe가 pace-deadline(벽시계) 의존이라
->   **하드웨어에 따라 objective inflate** → 느린 서버에서 P3(760k)가 3.5M 넘겨 wide로 오분류
->   가능(→ −1). "local check 통과=안전"·"probe는 결정적" 가정 폐기.
-> - **#8 재설계 (solver.py)**:
->   ① `_SAFE_TIME_GAP=1`: safe 경로 전체에서 진입=exit+1, 팽창 시간창으로 x-분리 강제 →
->   같은 베이에서 timestamp 공유+x겹침 조합 원천 제거. ② `_verify_structural`: **순수
->   interval/AABB 런타임 인증서**(Shapely 0회) — safe 경로는 이 인증 통과분만 반환, 실패 시
->   floor로 강등. ③ floor(`floor_assignments`): no-coexist+시간갭≥1, degenerate fallback
->   삭제(`InstanceFitError` 명시 실패). ④ 라우팅: `<250k`→narrow(P1/P2, 서버 2회 실증) ·
->   `<8M`→**safe(인증 컬럼→floor)** · `≥8M`→wide. wide 임계 3.5M→**8M**(P3 오분류에 10.5×
->   inflate 필요; P4=15.27M은 inflate가 위로만 작용해 항상 통과). 오류방향 전부 fail-safe.
-> - 검증: 회귀 6/6(독립 구조검사 추가)·placement PASS·빌드 3경로 smoke·**train 40 전수:
->   40/40 feasible, safe경로 위험쌍(bbox겹침+동일ts) 0개**, pace 비결정성 관측시에도 safe로만 표류.
-> - **다음 제출 가능: 2026-07-01 03:01:59 UTC**(#6 +12h) 이후 — #7이 이미 나갔다면 #7 +12h.
+> **🎉 #8(07-04): 6/6 ALL FEASIBLE, 총합 122.7M, Tier 19 — baseline freeze (commit `687fb09`).**
+> **#9 준비완료: safe(컬럼) 경로 최적화로 P3 24.5M → ~10~15M 목표.**
+> - 진단: safe 대역 objective의 83~99%가 w1×tardiness (컬럼 직렬화 → makespan↑).
+>   컬럼 모드 유일 자원 = **베이 폭** (x-disjoint라 y 무관).
+> - **#9 변경 (전부 x_gap 모드 한정, feasibility 구조 무손상)**:
+>   A1 방향선택 최소면적→**최소폭**(동시 컬럼↑, **−49.8%**) · A2 safe max_entries 16→48(−3.1%) ·
+>   A3 멀티스타트 5→8 spec(−14.3%) · C 컬럼 로컬서치(잔여시간, 무퇴보 보험).
+>   **safe-band 누적 −58.3%** (94.9M→39.6M), 전부 feasible+인증+위험쌍 0.
+> - 보호: narrow objective 완전 동일 · wide 코드 무변경 · 인증서/라우터/floor/임계 무변경.
+> - 검증: 회귀 6/6 · placement PASS · 빌드 3경로 smoke (packaged prob_22 7.79M→5.02M).
+> - **다음 제출: #8 +12h(2026-07-05 01:21 UTC) 이후 #9 zip 업로드.**
 
 ## 1. 한 줄 요약
 "제출 불가 baseline"에서 시작해 **항상 feasible·시간안전·다단계 최적화 솔버**를 구축.
@@ -87,6 +81,8 @@
 | 4 | 06-29 08:38 | **infeasible** | P3만 −1, P1/P2/P4/P5/P6는 #1과 동일 → 엔트리포인트가 `solve_greedy`라 안전망 우회 |
 | 5 | 06-30 02:34 | **infeasible** | P1/P2/P4/P5/P6 모두 개선(단일스레드 동작 확인), P3만 여전히 −1 |
 | 6 | 06-30 15:01 | **infeasible** | 격리: P1/P2 #1과 동일(narrow 정상)·**P4/P5/P6 −29/−27/−70%**(wide 큰개선)·**P3만 여전히 −1** |
+| 7 | 07-01~ | **infeasible** | 컬럼 패킹(#7)도 P3 −1 → 사후진단: 동일ts 순서의존 잔존 + probe 오분류 가능 |
+| 8 | 07-04 13:21 | **🎉 feasible** | **6/6 ALL FEASIBLE** 총합 122.7M Tier 19 — 구조 인증서+시간갭+fail-safe 라우터 실증 |
 
 ## 6. 현재 상태 / 다음
 - ✅ 엔트리포인트 교정: `myalgorithm.py` → `solver.solve` (안전망 `_ensure_feasible` 경유) [#4 이후].
@@ -99,9 +95,11 @@
   컬럼 x-disjoint 보장** 검증).
 - ✅ 빌드 smoke **3경로**: narrow(prob_5)·column(prob_22)·wide(prob_21) 모두 feasibility 검증
   (하나라도 infeasible이면 빌드 실패).
-- ⚠️ **다음 액션: #7 제출**(2026-07-01 03:01:59 UTC 이후) → **P3 −1 제거** 확인.
-  P1/P2 무변경(narrow)·P4/P5/P6 무변경(wide)·P3만 컬럼 패킹(feasible 목표, 점수 무관).
-- ▶ P3 feasible 확인되면, 컬럼 패킹 목적값 개선(컬럼 내 다중배치·시간 재배열) 검토.
+- ✅ **#8 서버 실증: 6/6 ALL FEASIBLE** (P3=24.5M, 총합 122.7M, Tier 19) — baseline freeze.
+- ✅ **#9 safe 경로 최적화**: 최소폭 방향(A1, −49.8%) + max_entries 48(A2) + 8-spec
+  멀티스타트(A3) + 컬럼 로컬서치(C, 무퇴보) → **safe-band −58.3%**, 인증 구조 무손상.
+- ⚠️ **다음 액션: #9 제출**(#8 +12h = 07-05 01:21 UTC 이후) → P3 ~10~15M 기대, 나머지 불변.
+- ▶ #9 결과 확인 후: P6(61.4M) 보조 타겟 검토 (wide 경로, P3 안정 확인 후에만).
 
 ### 로컬 검증 명령 (제출 전 권장)
 ```bash

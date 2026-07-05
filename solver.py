@@ -391,8 +391,17 @@ def _earliest_coexist(bay: Bay, placed: list[Block], scheds: list[tuple[int, int
                                            if e + _SAFE_TIME_GAP > release})[:max_entries]
     else:
         cand_entries = sorted({release} | {e for _, e in scheds if e > release})[:max_entries]
-    orients = sorted(range(geom.n_orient(bid)),
-                     key=lambda oi: (lambda g: g.width * g.height)(geom.geom(bid, oi)))
+    if x_gap is not None:
+        # Column mode: bay WIDTH is the only capacity resource (x-disjoint
+        # columns; y never constrains).  Prefer the narrowest orientation so
+        # more columns fit side by side -- directly cuts makespan and hence
+        # tardiness, which dominates the safe route's objective (83-99% w1*obj1
+        # measured on the training safe band).
+        orients = sorted(range(geom.n_orient(bid)),
+                         key=lambda oi: (lambda g: (g.width, g.height))(geom.geom(bid, oi)))
+    else:
+        orients = sorted(range(geom.n_orient(bid)),
+                         key=lambda oi: (lambda g: g.width * g.height)(geom.geom(bid, oi)))
     for entry in cand_entries:
         exit_t = entry + proc
         parts = _partition(placed, scheds, entry, exit_t)   # once per entry, reused
@@ -810,7 +819,8 @@ def solve_lns(prob_info: dict, timelimit: float = 60.0,
 # =============================================================================
 
 def _local_search(prob_info: dict, assignments: list[dict], end: float,
-                  cur_obj: float, max_entries: int = 16, max_pos: int = 40) -> list[dict]:
+                  cur_obj: float, max_entries: int = 16, max_pos: int = 40,
+                  x_gap: float | None = None) -> list[dict]:
     """
     Hill-climbing local search run on whatever time is left after the multi-start
     workers finish (easy/medium instances finish early; hard ones leave no slack,
@@ -823,6 +833,14 @@ def _local_search(prob_info: dict, assignments: list[dict], end: float,
     (preference) together.  Every insertion is _feasible_pre-checked and rejected
     moves revert to the saved placement, so the solution stays feasible and the
     objective never rises (strictly non-regressing vs the multi-start result).
+
+    `x_gap` (safe/column mode): passed through to _earliest_coexist, so every
+    relocation target is itself a column placement (x-disjoint by >= x_gap
+    within an inflated time window, entries gapped >= _SAFE_TIME_GAP after
+    exits).  Removing a block never violates the structural certificate and
+    every insertion re-establishes it, so the invariant holds move by move;
+    the caller still runs _verify_structural on the final result before
+    shipping it.
     """
     blocks = prob_info["blocks"]
     bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
@@ -875,7 +893,8 @@ def _local_search(prob_info: dict, assignments: list[dict], end: float,
             best = None                    # (obj, assignment dict)
             for jt in fit[bid]:
                 res = _earliest_coexist(bays[jt], placed[jt], scheds[jt], blocks, geom,
-                                        bid, r, p, max_entries, max_pos, end)
+                                        bid, r, p, max_entries, max_pos, end,
+                                        x_gap=x_gap)
                 if res is None:
                     continue
                 oi, x, y, entry, exit_t = res
@@ -1042,19 +1061,36 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
         col_end = end - reserve
         col_best = None
         col_obj = float("inf")
-        for seed, km in ((0, "exit"), (0, "tard"), (1, "exit"), (1, "tard"), (2, "exit")):
+        # 8-spec multi-start: min-width orientations (A1) + wide entry candidates
+        # (A2, max_entries=48) made each construction fast (<6s on the hardest
+        # training safe-band instance), and the best spec varies per instance --
+        # measured -58% total on the training safe band vs the #8 configuration,
+        # every result feasible AND certificate-passing.
+        for seed, km in ((0, "exit"), (0, "tard"), (1, "exit"), (1, "tard"),
+                         (2, "exit"), (2, "tard"), (3, "exit"), (4, "exit")):
             rem = col_end - time.time()
             if rem < 0.5:
                 break
             try:
                 a = _greedy_assignments(prob_info, rem / 0.9, seed=seed,
-                                        key_mode=km, max_entries=16, max_pos=40,
+                                        key_mode=km, max_entries=48, max_pos=40,
                                         x_gap=_COLUMN_X_GAP)
             except Exception:
                 continue
             o = compute_objective(prob_info, a)[0]
             if o < col_obj:
                 col_obj, col_best = o, a
+
+        # Leftover-time column local search: relocations stay in column mode
+        # (x_gap passed through), strictly non-regressing, certificate re-checked
+        # below on the final result either way.
+        if col_best is not None and time.time() < col_end - 1.0:
+            try:
+                col_best = _local_search(prob_info, col_best, col_end, col_obj,
+                                         max_entries=48, max_pos=40,
+                                         x_gap=_COLUMN_X_GAP)
+            except Exception:
+                pass
 
         if col_best is not None:
             ok, _reason = _verify_structural(prob_info, col_best)

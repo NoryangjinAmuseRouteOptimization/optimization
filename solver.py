@@ -927,7 +927,7 @@ def _worker(args):
     """
     prob_info, budget, seed, key_mode = args
     a = _greedy_assignments(prob_info, budget, seed=seed, key_mode=key_mode,
-                            max_entries=32, max_pos=80)
+                            max_entries=48, max_pos=120)
     obj, _, _, _ = compute_objective(prob_info, a)
     return obj, a
 
@@ -1061,13 +1061,18 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
         col_end = end - reserve
         col_best = None
         col_obj = float("inf")
-        # 8-spec multi-start: min-width orientations (A1) + wide entry candidates
+        # 16-spec multi-start: min-width orientations (A1) + wide entry candidates
         # (A2, max_entries=48) made each construction fast (<6s on the hardest
         # training safe-band instance), and the best spec varies per instance --
-        # measured -58% total on the training safe band vs the #8 configuration,
-        # every result feasible AND certificate-passing.
+        # the first 8 specs measured -58% total on the training safe band vs the
+        # #8 configuration, and extending to 16 specs measured another -5.9%
+        # (5 improved / 4 unchanged, no regressions), every result feasible AND
+        # certificate-passing.  The loop is time-bounded, so slow instances
+        # simply run fewer specs.
         for seed, km in ((0, "exit"), (0, "tard"), (1, "exit"), (1, "tard"),
-                         (2, "exit"), (2, "tard"), (3, "exit"), (4, "exit")):
+                         (2, "exit"), (2, "tard"), (3, "exit"), (4, "exit"),
+                         (3, "tard"), (4, "tard"), (5, "exit"), (5, "tard"),
+                         (6, "exit"), (7, "exit"), (6, "tard"), (8, "exit")):
             rem = col_end - time.time()
             if rem < 0.5:
                 break
@@ -1130,12 +1135,19 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
             best_a = None  # sandbox blocked multiprocessing -> single-threaded
 
     # -- Strong single-threaded path (ALWAYS runs on the server) ---------------
-    # Sequential multi-start (no multiprocessing needed): try several seeds and
-    # both bay-selection keys, keep the best.  Construction returns as soon as all
-    # blocks are placed, so medium instances fit many attempts while large ones
-    # fit one; ~30% of the remaining budget is reserved for the local search.
-    # This is the workhorse on the server (where multiprocessing is blocked) and
-    # the fallback whenever the bonus path produced nothing.
+    # One DEEP construction, then any remaining construction time goes to more
+    # seeds.  On large (P4/P5/P6-scale) instances the first spec's pace deadlines
+    # consume the whole construction window, so later specs never run there --
+    # and that is the MEASURED optimum: slicing the window into 2 or 4 equal
+    # multistart slots came back +31% / +52% worse on the large training set
+    # (shallow constructions bail to the empty-window fallback and tardiness
+    # explodes).  Depth beats diversity for large instances; medium instances
+    # still finish early and get the extra seeds.
+    #
+    # Candidate search width 48/120 (was 32/80): with the AABB fast-path each
+    # candidate is cheap, and the wider search measured -11.3% on the large
+    # training set (best on 6/7 instances).  ~30% of the remaining budget is
+    # reserved for the local search below (70/30 beat 55/45 and 85/15).
     if best_a is None:
         construct_end = time.time() + (end - time.time()) * 0.70
         best_obj = float("inf")
@@ -1147,7 +1159,7 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
                 break
             try:
                 a = _greedy_assignments(prob_info, rem / 0.9, seed=seed,
-                                        key_mode=km, max_entries=32, max_pos=80)
+                                        key_mode=km, max_entries=48, max_pos=120)
             except Exception:
                 continue
             o = compute_objective(prob_info, a)[0]
@@ -1164,10 +1176,13 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
         raise InstanceFitError("no solution could be constructed")
 
     # -- Local search on any remaining time (single-threaded, non-regressing) --
+    # Same widened candidate search as the construction (48/120) -- the W3
+    # experiment measured its gain with the local search running at this width.
     if time.time() < end - 0.5:
         try:
             best_a = _local_search(prob_info, best_a, end,
-                                   compute_objective(prob_info, best_a)[0])
+                                   compute_objective(prob_info, best_a)[0],
+                                   max_entries=48, max_pos=120)
         except Exception:
             pass
 

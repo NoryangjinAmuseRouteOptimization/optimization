@@ -5,17 +5,14 @@
 > 제출 이력: `docs/submissions_log.md`
 
 > ## 🔴 다음 액션 (NEXT)
-> **🎉 #8(07-04): 6/6 ALL FEASIBLE, 총합 122.7M, Tier 19 — baseline freeze (commit `687fb09`).**
-> **#9 준비완료: safe(컬럼) 경로 최적화로 P3 24.5M → ~10~15M 목표.**
-> - 진단: safe 대역 objective의 83~99%가 w1×tardiness (컬럼 직렬화 → makespan↑).
->   컬럼 모드 유일 자원 = **베이 폭** (x-disjoint라 y 무관).
-> - **#9 변경 (전부 x_gap 모드 한정, feasibility 구조 무손상)**:
->   A1 방향선택 최소면적→**최소폭**(동시 컬럼↑, **−49.8%**) · A2 safe max_entries 16→48(−3.1%) ·
->   A3 멀티스타트 5→8 spec(−14.3%) · C 컬럼 로컬서치(잔여시간, 무퇴보 보험).
->   **safe-band 누적 −58.3%** (94.9M→39.6M), 전부 feasible+인증+위험쌍 0.
-> - 보호: narrow objective 완전 동일 · wide 코드 무변경 · 인증서/라우터/floor/임계 무변경.
-> - 검증: 회귀 6/6 · placement PASS · 빌드 3경로 smoke (packaged prob_22 7.79M→5.02M).
-> - **다음 제출: #8 +12h(2026-07-05 01:21 UTC) 이후 #9 zip 업로드.**
+> **#10(07-06): 6/6 feasible, 총합 91.8M (P6 −23%). #11 = large route 안전강화.**
+> - large route 병목실험(L1~L5, paired): 단일스레드 large = **단일 deep exit 구축 + 48/120 LS(70/30)**가
+>   측정된 국소최적. LNS주력 +37%, 창분할 +32~52%, dual-key(얕은구축) +32% 전부 악화. tard키는
+>   large −4.2%지만 인스턴스별 ±20% 동전던지기 → **"개선원인 불명확 제출금지" 규칙 위반, 기각**.
+> - **#11 채택(둘 다 non-regressing, 하방리스크 0)**: ① mp 워커 키 다양화(exit+tard keep-min,
+>   mp 허용시만 효과·차단시 #10동일) ② `_lns_phase` LNS꼬리(LS 조기수렴시 무퇴보 보험).
+> - **정직한 기대**: 단일스레드 무변경 → 서버 mp차단이면 #10동일(91.8M), 허용이면 P4/P5/P6 개선.
+>   부수효과로 **서버 mp 작동여부 확정**. 다음 제출: #10 +12h(07-06 20:07 UTC) 경과 → 즉시 가능.
 
 ## 1. 한 줄 요약
 "제출 불가 baseline"에서 시작해 **항상 feasible·시간안전·다단계 최적화 솔버**를 구축.
@@ -83,6 +80,8 @@
 | 6 | 06-30 15:01 | **infeasible** | 격리: P1/P2 #1과 동일(narrow 정상)·**P4/P5/P6 −29/−27/−70%**(wide 큰개선)·**P3만 여전히 −1** |
 | 7 | 07-01~ | **infeasible** | 컬럼 패킹(#7)도 P3 −1 → 사후진단: 동일ts 순서의존 잔존 + probe 오분류 가능 |
 | 8 | 07-04 13:21 | **🎉 feasible** | **6/6 ALL FEASIBLE** 총합 122.7M Tier 19 — 구조 인증서+시간갭+fail-safe 라우터 실증 |
+| 9 | 07-05 06:40 | feasible | P3 24.5M→10.79M(−56%) safe컬럼 최적화, 총합 108.9M |
+| 10 | 07-06 08:07 | feasible | P6 61.4M→47.15M(−23%) wide 48/120, 총합 **91.8M** |
 
 ## 6. 현재 상태 / 다음
 - ✅ 엔트리포인트 교정: `myalgorithm.py` → `solver.solve` (안전망 `_ensure_feasible` 경유) [#4 이후].

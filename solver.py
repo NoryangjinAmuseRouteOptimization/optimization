@@ -912,6 +912,120 @@ def _local_search(prob_info: dict, assignments: list[dict], end: float,
     return list(assign.values())
 
 
+def _lns_phase(prob_info: dict, assignments: list[dict], end: float, cur_obj: float,
+               max_entries: int = 48, max_pos: int = 120, key_mode: str = "exit",
+               seed: int = 1) -> list[dict]:
+    """
+    Ruin-and-recreate improvement on an existing assignment list, used up to
+    `end`.  Each iteration removes the k/2 most-tardy blocks plus k/2 random ones
+    and reinserts them (earliest-coexist, wide search); the move is kept only if
+    the EXACT objective strictly decreases, otherwise it is reverted in O(k) to
+    the saved placements.  Every reinsertion is _earliest_coexist-validated and
+    every revert restores known-good placements, so the solution is feasible at
+    all times and its objective NEVER rises above `cur_obj` (strictly
+    non-regressing vs the input).
+
+    On the large route this runs as a TAIL after _local_search converges -- it
+    consumes only the time LS leaves, so it can only help or do nothing, never
+    cost LS its budget.  Whole-solution objective is tardiness-dominated on
+    P5/P6-scale instances, and destroying the worst-tardy blocks is a stronger
+    move than the single-block relocation LS makes there.
+    """
+    import random
+    blocks = prob_info["blocks"]
+    bays = [Bay.from_dict(d, i) for i, d in enumerate(prob_info["bays"])]
+    n_bays = len(bays)
+    geom = placement.GeometryCache(prob_info)
+    areas = [b.width * b.height for b in bays]
+    u = [(sum(areas) / n_bays) / a for a in areas]
+    fit: dict[int, dict[int, tuple]] = {
+        bid: {j: r for j in range(n_bays)
+              if (r := _fitting_orientation(bays[j], geom, bid)) is not None}
+        for bid in range(len(blocks))}
+
+    placed: list[list[Block]] = [[] for _ in range(n_bays)]
+    scheds: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
+    wload = [0.0] * n_bays
+    assign: dict[int, dict] = {}
+
+    def _add(a: dict) -> None:
+        bid, j = a["block_id"], a["bay_id"]
+        placed[j].append(Block(block_id=bid, block_data=blocks[bid],
+                               x=a["x"], y=a["y"], orient_idx=a["orient_idx"]))
+        scheds[j].append((a["entry_time"], a["exit_time"]))
+        wload[j] += u[j] * blocks[bid]["workload"]
+        assign[bid] = a
+
+    def _remove(bid: int) -> None:
+        a = assign.pop(bid); j = a["bay_id"]
+        idx = next(i for i, b in enumerate(placed[j]) if b.block_id == bid)
+        placed[j].pop(idx); scheds[j].pop(idx)
+        wload[j] -= u[j] * blocks[bid]["workload"]
+
+    def _insert(bid: int, deadline: float | None) -> None:
+        blk = blocks[bid]
+        r, p = blk["release_time"], blk["processing_time"]
+        prefs = blk["bay_preferences"]; s_max = max(prefs)
+        best = None
+        if deadline is not None:
+            for j in fit[bid]:
+                res = _earliest_coexist(bays[j], placed[j], scheds[j], blocks, geom,
+                                        bid, r, p, max_entries, max_pos, deadline)
+                if res is None:
+                    continue
+                oi, x, y, entry, exit_t = res
+                key = _bay_select_key(key_mode, exit_t, blk["due_date"],
+                                      s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                if best is None or key < best[0]:
+                    best = (key, j, oi, x, y, entry, exit_t)
+        if best is None:
+            for j, (oi, x, y) in fit[bid].items():
+                entry = _empty_window(scheds[j], r, p); exit_t = entry + p
+                key = _bay_select_key(key_mode, exit_t, blk["due_date"],
+                                      s_max - prefs[j], wload[j] + u[j] * blk["workload"])
+                if best is None or key < best[0]:
+                    best = (key, j, oi, x, y, entry, exit_t)
+        if best is None:
+            # A victim block was already placed, so it fits some bay -- unreachable
+            # for well-formed input.  Fail loudly rather than emit a degenerate.
+            raise InstanceFitError(f"block {bid} fits no bay in any orientation")
+        _, j, oi, x, y, entry, exit_t = best
+        _add({"block_id": bid, "bay_id": j, "x": int(x), "y": int(y),
+              "orient_idx": oi, "entry_time": int(entry), "exit_time": int(exit_t)})
+
+    for a in assignments:
+        _add(a)
+    rng = random.Random(seed * 7919 + 1)
+    k = max(3, min(25, len(blocks) // 15))
+    best_obj = cur_obj
+    while time.time() < end:
+        tard = sorted(assign.values(),
+                      key=lambda a: blocks[a["block_id"]]["due_date"] - a["exit_time"])
+        n_t = max(1, k // 2)
+        victims = [a["block_id"] for a in tard[:n_t]]
+        pool = [b for b in assign if b not in victims]
+        if pool:
+            victims += rng.sample(pool, min(k - n_t, len(pool)))
+        saved = {b: assign[b] for b in victims}
+        for b in victims:
+            _remove(b)
+        for b in sorted(victims, key=lambda b: (blocks[b]["due_date"],
+                                                blocks[b]["processing_time"])):
+            now = time.time()
+            dl = min(end, now + 0.5) if now < end else None
+            _insert(b, dl)
+        o = compute_objective(prob_info, list(assign.values()))[0]
+        if o < best_obj - 1e-9:
+            best_obj = o                        # accept
+        else:
+            for b in victims:                   # revert in O(k)
+                if b in assign:
+                    _remove(b)
+            for b in victims:
+                _add(saved[b])
+    return list(assign.values())
+
+
 # =============================================================================
 # Parallel multi-start (uses the 4 allowed cores; keeps the best feasible run)
 # =============================================================================
@@ -1121,13 +1235,24 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
     # NOT depend on it.  Treat it as a best-effort booster: if it works, keep the
     # best worker; if it raises or yields nothing, fall through to the strong
     # single-threaded path below.
+    # Worker specs are DIVERSIFIED across bay-selection keys: on the large route
+    # the best key is per-instance unpredictable (training: exit vs tard swings
+    # +-20% either way, neither dominates), and single-threaded we can only afford
+    # ONE deep construction so we cannot keep the better.  In parallel each worker
+    # gets the FULL budget, so running exit and tard side by side and keeping the
+    # min captures that per-instance choice for free -- WHEN multiprocessing is
+    # available.  If the sandbox blocks it (our working assumption) this whole
+    # block raises and we fall through to the single-threaded path unchanged, so
+    # the change is strictly non-regressing.
     if budget >= 8.0:
         try:
             import os
             from concurrent.futures import ProcessPoolExecutor
             n_workers = min(workers, os.cpu_count() or 1)
             if n_workers >= 2:
-                tasks = [(prob_info, budget, s, "exit") for s in range(n_workers)]
+                worker_specs = [(0, "exit"), (0, "tard"), (1, "exit"), (1, "tard")]
+                tasks = [(prob_info, budget, s, km)
+                         for (s, km) in worker_specs[:n_workers]]
                 with ProcessPoolExecutor(max_workers=n_workers) as ex:
                     results = list(ex.map(_worker, tasks))
                 best_a = min(results, key=lambda r: r[0])[1]
@@ -1183,6 +1308,18 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
             best_a = _local_search(prob_info, best_a, end,
                                    compute_objective(prob_info, best_a)[0],
                                    max_entries=48, max_pos=120)
+        except Exception:
+            pass
+
+    # -- Ruin-and-recreate LNS on the time the local search left after it
+    # converged (large route only).  Strictly non-regressing, so this can only
+    # improve the tardiness-dominated large instances or leave them unchanged;
+    # if LS used the whole window, this is a no-op.
+    if time.time() < end - 1.0:
+        try:
+            best_a = _lns_phase(prob_info, best_a, end,
+                                compute_objective(prob_info, best_a)[0],
+                                max_entries=48, max_pos=120)
         except Exception:
             pass
 

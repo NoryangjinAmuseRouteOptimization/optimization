@@ -1,8 +1,8 @@
 """
 test_solver_regression.py -- pin the submission-safety fixes so they can't regress.
 
-Covers the two failures that actually cost us leaderboard points, plus the
-server execution model:
+Covers the failures that actually cost us leaderboard points, the packaged
+entry point, objective polishing, and the server execution model:
 
   1. test_aabb_boundary  -- the AABB fast-path must NOT accept a candidate whose
      bounding box pokes a hair past the bay wall.  candidate_positions filters
@@ -15,8 +15,15 @@ server execution model:
      solution with the always-feasible sequential schedule, so a buggy optimizing
      path can never produce a -1 submission.
 
-  3. test_single_threaded_feasible  -- with multiprocessing DISABLED (the server
-     scenario), solve() must return feasible solutions within the time limit.
+  3. test_submission_entrypoint -- the generated myalgorithm.py must invoke the
+     full solver.algorithm path, not the obsolete solve_greedy path.
+
+  4. test_workload_local_search -- a pure workload-imbalance objective must be
+     improved even when tardiness and preference penalties are both zero.
+
+  5. test_single_threaded_feasible  -- with multiprocessing DISABLED (the
+     sandbox-fallback scenario), solve() must return feasible solutions within
+     the time limit.
 
 Run:
     cd <repo root>
@@ -27,6 +34,7 @@ import json
 import pathlib
 import sys
 import time
+import types
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "baseline"))   # utils
@@ -35,6 +43,8 @@ sys.path.insert(0, str(ROOT))                 # solver, placement
 from utils import Bay, Block, check_feasibility   # noqa: E402
 import placement                                  # noqa: E402
 import solver                                     # noqa: E402
+sys.path.insert(0, str(ROOT / "tools"))
+import build_submission                           # noqa: E402
 
 
 def _rect_block(verts):
@@ -93,8 +103,60 @@ def test_safety_net() -> bool:
     return ok
 
 
+def test_submission_entrypoint() -> bool:
+    """The generated ZIP entry point must call the full guarded solver."""
+    called = []
+
+    def _algorithm(prob_info, timelimit=60):
+        called.append((prob_info, timelimit))
+        return {"sentinel": True}
+
+    fake_solver = types.SimpleNamespace(algorithm=_algorithm)
+    original = sys.modules.get("solver")
+    namespace: dict = {}
+    try:
+        sys.modules["solver"] = fake_solver
+        exec(build_submission.MYALGORITHM_SRC, namespace)
+        result = namespace["algorithm"]({"x": 1}, 17)
+    finally:
+        if original is None:
+            sys.modules.pop("solver", None)
+        else:
+            sys.modules["solver"] = original
+
+    ok = result == {"sentinel": True} and called == [({"x": 1}, 17)]
+    print(f"  test_submission_entrypoint: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_workload_local_search() -> bool:
+    """Local search must improve a pure-Z2 instance, not stop at zero Z1/Z3."""
+    block = _rect_block([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    block["workload"] = 10
+    block["bay_preferences"] = [50, 50]
+    prob = {
+        "bays": [{"width": 10, "height": 10}, {"width": 10, "height": 10}],
+        "blocks": [dict(block), dict(block)],
+        "weights": {"w1": 0, "w2": 1, "w3": 0},
+    }
+    assignments = [
+        {"block_id": 0, "bay_id": 0, "x": 0, "y": 0, "orient_idx": 0,
+         "entry_time": 0, "exit_time": 10},
+        {"block_id": 1, "bay_id": 0, "x": 2, "y": 0, "orient_idx": 0,
+         "entry_time": 0, "exit_time": 10},
+    ]
+    before = solver.compute_objective(prob, assignments)[0]
+    improved = solver._local_search(prob, assignments, time.time() + 1.0, before)
+    after = solver.compute_objective(prob, improved)[0]
+    sol = {"operations": solver._build_operations(improved)}
+    ok = after < before and check_feasibility(prob, sol)["feasible"]
+    print(f"  test_workload_local_search: {'PASS' if ok else 'FAIL'} "
+          f"({before:.0f} -> {after:.0f})")
+    return ok
+
+
 def test_single_threaded_feasible() -> bool:
-    """Server scenario: multiprocessing disabled -> solve() feasible & in time."""
+    """Sandbox fallback: multiprocessing disabled -> solve() feasible & in time."""
     import concurrent.futures as cf
 
     class _Blocked:
@@ -130,6 +192,8 @@ if __name__ == "__main__":
     results = [
         test_aabb_boundary(),
         test_safety_net(),
+        test_submission_entrypoint(),
+        test_workload_local_search(),
         test_single_threaded_feasible(),
     ]
     print(f"\nRESULT: {sum(results)}/{len(results)} passed")

@@ -4,7 +4,7 @@ build_submission.py -- assemble and validate the competition submission zip
 
 Produces dist/submission.zip with the layout the evaluation server expects:
 
-    myalgorithm.py     (root)  -- entry point; calls solver.solve_greedy
+    myalgorithm.py     (root)  -- entry point; calls solver.algorithm
     solver.py          (root)  -- our solver
     placement.py       (root)  -- spatial/geometry module
     utils.py           (root)  -- OFFICIAL, unmodified (server overwrites it)
@@ -43,7 +43,7 @@ MYALGORITHM_SRC = '''\
 # The server calls algorithm(prob_info, timelimit); we delegate to solver.
 def algorithm(prob_info, timelimit=60):
     import solver
-    return solver.solve_greedy(prob_info, timelimit)
+    return solver.algorithm(prob_info, timelimit)
 '''
 
 # Files copied verbatim from the repo into the zip root.
@@ -87,11 +87,14 @@ def validate(zip_path: pathlib.Path, instance: pathlib.Path, timelimit: float):
     size_mb = zip_path.stat().st_size / 1e6
     with zipfile.ZipFile(zip_path) as z:
         names = z.namelist()
+        entrypoint = z.read("myalgorithm.py").decode("utf-8")
     print(f"zip       : {zip_path}  ({size_mb:.3f} MB)")
     print(f"contents  : {names}")
     assert "myalgorithm.py" in names, "myalgorithm.py missing from zip root"
     assert all("/" not in n for n in names), "files must be at zip root"
     assert size_mb <= 15.0, f"zip exceeds 15 MB ({size_mb:.2f})"
+    assert "solver.algorithm(prob_info, timelimit)" in entrypoint, \
+        "submission entry point must delegate to solver.algorithm"
 
     # 2. Functional check in an ISOLATED dir (only the unzipped files on path),
     #    run as a child process so nothing from the repo leaks in.
@@ -111,8 +114,14 @@ def validate(zip_path: pathlib.Path, instance: pathlib.Path, timelimit: float):
             "sys.exit(0 if r['feasible'] else 1)"
         )
         print(f"smoke test: {instance.name} (timelimit={timelimit}s, isolated)")
-        res = subprocess.run([sys.executable, "-c", runner], cwd=tdp,
-                             capture_output=True, text=True)
+        timeout = timelimit + max(5.0, timelimit * 0.10)
+        try:
+            res = subprocess.run([sys.executable, "-c", runner], cwd=tdp,
+                                 capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise SystemExit(
+                f"submission FAILED isolated timeout ({timeout:.1f}s)"
+            ) from exc
         out = (res.stdout + res.stderr).strip()
         print(f"result    : {out}")
         if res.returncode != 0:

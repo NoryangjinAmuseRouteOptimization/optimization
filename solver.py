@@ -706,7 +706,12 @@ def _local_search(prob_info: dict, assignments: list[dict], end: float,
                     if (r := _fitting_orientation(bays[j], geom, bid)) is not None}
 
     w = prob_info.get("weights", {})
-    w1, w3 = w.get("w1", 1.0), w.get("w3", 1.0)
+    w1 = w.get("w1", 1.0)
+    w2 = w.get("w2", 1.0)
+    w3 = w.get("w3", 1.0)
+    areas = [b.width * b.height for b in bays]
+    avg_area = sum(areas) / n_bays
+    u = [avg_area / a for a in areas]
 
     placed: list[list[Block]] = [[] for _ in range(n_bays)]
     scheds: list[list[tuple[int, int]]] = [[] for _ in range(n_bays)]
@@ -726,19 +731,43 @@ def _local_search(prob_info: dict, assignments: list[dict], end: float,
     for a in assignments:
         _add(a)
 
-    def _contrib(bid):
-        a = assign[bid]; blk = blocks[bid]
-        tard = max(0, a["exit_time"] - blk["due_date"])
-        pen = max(blk["bay_preferences"]) - blk["bay_preferences"][a["bay_id"]]
-        return w1 * tard + w3 * pen
+    def _ranked_blocks():
+        """Rank blocks by removable objective pressure, including workload Z2.
+
+        The previous ranking used only tardiness and preference.  If both were
+        already zero, local search stopped even when workload imbalance was the
+        entire remaining objective.  For a block in a heavily loaded bay, the
+        decrease in exact normalized imbalance obtained by temporarily removing
+        it is a useful, cheap victim score.  Candidate moves are still accepted
+        only after compute_objective verifies a strict total-objective decrease.
+        """
+        loads = [0.0] * n_bays
+        for a in assign.values():
+            loads[a["bay_id"]] += blocks[a["block_id"]]["workload"]
+        normalized = [u[j] * loads[j] for j in range(n_bays)]
+        cur_z2 = math.floor(max(normalized) - min(normalized)) if n_bays >= 2 else 0
+
+        ranked = []
+        for bid, a in assign.items():
+            blk = blocks[bid]
+            tard = max(0, a["exit_time"] - blk["due_date"])
+            pen = max(blk["bay_preferences"]) - blk["bay_preferences"][a["bay_id"]]
+            relief = 0
+            if n_bays >= 2 and cur_z2 > 0:
+                after = list(normalized)
+                after[a["bay_id"]] -= u[a["bay_id"]] * blk["workload"]
+                relief = max(0, cur_z2 - math.floor(max(after) - min(after)))
+            ranked.append((w1 * tard + w3 * pen + w2 * relief, bid))
+        ranked.sort(reverse=True)
+        return ranked
 
     improved = True
     while improved and time.time() < end:
         improved = False
-        for bid in sorted(assign, key=_contrib, reverse=True):
+        for pressure, bid in _ranked_blocks():
             if time.time() >= end:
                 break
-            if _contrib(bid) <= 0:
+            if pressure <= 0:
                 break                      # remaining blocks contribute nothing
             saved = assign[bid]
             blk = blocks[bid]
@@ -826,8 +855,8 @@ def solve(prob_info: dict, timelimit: float = 60.0, workers: int = 4) -> dict:
     # both bay-selection keys, keep the best.  Construction returns as soon as all
     # blocks are placed, so small/medium instances fit many attempts while large
     # ones fit one; ~30% of the budget is reserved for the local search below.
-    # This is the workhorse on the server (where multiprocessing is blocked) and
-    # the fallback whenever the bonus path produced nothing.
+    # This is the workhorse whenever multiprocessing is blocked or unavailable,
+    # and the fallback whenever the optional parallel path produced nothing.
     if best_a is None:
         construct_end = t0 + budget * 0.70
         best_obj = float("inf")

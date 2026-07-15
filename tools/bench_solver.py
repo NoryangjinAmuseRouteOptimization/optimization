@@ -2,7 +2,7 @@
 bench_solver.py -- P3 critical-path harness: end-to-end solver evaluation
 ===============================================================================
 
-Runs a solver (default: the real submission entry point myalgorithm.algorithm)
+Runs a solver (default: the real submission entry point solver.algorithm)
 on every training instance, checks feasibility with the EXACT evaluator
 (utils.check_feasibility), and reports the real competition objective and its
 components -- the metric that actually decides the leaderboard, not packing
@@ -32,7 +32,7 @@ feasible runs.
 Run:
     python tools/bench_solver.py [--timelimit S] [--jobs N]
                                  [--instances 'data/train/*.json']
-                                 [--solver baseline] [--out results.json]
+                                 [--solver submission] [--out results.json]
 """
 
 import argparse
@@ -70,6 +70,9 @@ def _solve_one(args: tuple) -> dict:
     if solver_name == "baseline":
         import myalgorithm
         solver = myalgorithm.algorithm
+    elif solver_name == "submission":
+        import solver as _s
+        solver = _s.algorithm
     elif solver_name == "sequential":
         import solver as _s
         solver = _s.solve_sequential
@@ -114,11 +117,14 @@ def _solve_one(args: tuple) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instances", default=str(ROOT / "data" / "train" / "*.json"))
-    ap.add_argument("--solver", default="baseline")
+    ap.add_argument("--solver", default="submission",
+                    choices=["submission", "baseline", "sequential", "greedy",
+                             "multistart", "lns"])
     ap.add_argument("--timelimit", type=float, default=30.0,
                     help="wall-clock seconds per instance (server uses minutes-30min)")
-    ap.add_argument("--jobs", type=int, default=4,
-                    help="parallel instances (server allows up to 4 cores)")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="parallel instances; keep 1 for submission/multistart so "
+                         "the solver alone owns the server's four-core budget")
     ap.add_argument("--out", default=None, help="optional JSON results dump")
     args = ap.parse_args()
 
@@ -136,11 +142,22 @@ def main():
 
     tasks = [(f, args.solver, args.timelimit) for f in files]
     results: dict[str, dict] = {}
-    with ProcessPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(_solve_one, t): t[0] for t in tasks}
-        for fut in as_completed(futs):
-            r = fut.result()
+    if args.jobs == 1:
+        # Avoid requiring multiprocessing merely to run a single benchmark job.
+        # This also works inside firejail-like environments where semaphores/fork
+        # are unavailable; the submission solver has its own guarded portfolio.
+        for task in tasks:
+            r = _solve_one(task)
             results[r["name"]] = r
+    else:
+        if args.solver in {"submission", "multistart"}:
+            print("WARNING: parallel instances plus internal solver workers may "
+                  "oversubscribe the four-core server budget")
+        with ProcessPoolExecutor(max_workers=args.jobs) as ex:
+            futs = {ex.submit(_solve_one, t): t[0] for t in tasks}
+            for fut in as_completed(futs):
+                r = fut.result()
+                results[r["name"]] = r
 
     # Print in instance order.
     n_feas = 0
